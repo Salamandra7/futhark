@@ -5,8 +5,6 @@ module Futhark.Util.Options
        , commonOptions
        ) where
 
-import Data.Version
-import System.Environment
 import Control.Monad.IO.Class
 import System.IO
 import System.Exit
@@ -22,10 +20,12 @@ type FunOptDescr cfg = OptDescr (Either (IO ()) (cfg -> cfg))
 -- (while always adding 'commonOptions').
 mainWithOptions :: cfg
                 -> [FunOptDescr cfg]
+                -> String
                 -> ([String] -> cfg -> Maybe (IO ()))
+                -> String
+                -> [String]
                 -> IO ()
-mainWithOptions emptyConfig commandLineOptions f = do
-  args <- getArgs
+mainWithOptions emptyConfig commandLineOptions usage f prog args =
   case getOpt' Permute commandLineOptions' args of
     (opts, nonopts, [], []) ->
       case applyOpts opts of
@@ -37,16 +37,15 @@ mainWithOptions emptyConfig commandLineOptions f = do
   where applyOpts opts = do fs <- sequence opts
                             return $ foldl (.) id (reverse fs) emptyConfig
 
-        invalid nonopts unrecs errs = do usage <- usageStr commandLineOptions'
-                                         badOptions usage nonopts errs unrecs
+        invalid nonopts unrecs errs = do help <- helpStr prog usage commandLineOptions'
+                                         badOptions help nonopts errs unrecs
 
         commandLineOptions' =
-          commonOptions commandLineOptions ++ commandLineOptions
+          commonOptions prog usage commandLineOptions ++ commandLineOptions
 
-usageStr :: [OptDescr a] -> IO String
-usageStr opts = do
-  prog <- getProgName
-  let header = "Help for " ++ prog ++ " (Futhark " ++ showVersion version ++ ")"
+helpStr :: String -> String -> [OptDescr a] -> IO String
+helpStr prog usage opts = do
+  let header = unlines ["Usage: " ++ prog ++ " " ++ usage, "Options:"]
   return $ usageInfo header opts
 
 badOptions :: String -> [String] -> [String] -> [String] -> IO ()
@@ -62,8 +61,8 @@ errput = liftIO . hPutStrLn stderr
 
 -- | Common definitions for @-v@ and @-h@, given the list of all other
 -- options.
-commonOptions :: [FunOptDescr cfg] -> [FunOptDescr cfg]
-commonOptions options =
+commonOptions :: String -> String -> [FunOptDescr cfg] -> [FunOptDescr cfg]
+commonOptions prog usage options =
   [ Option "V" ["version"]
     (NoArg $ Left $ do header
                        exitSuccess)
@@ -72,11 +71,12 @@ commonOptions options =
   , Option "h" ["help"]
     (NoArg $ Left $ do header
                        putStrLn ""
-                       putStrLn =<< usageStr (commonOptions [] ++ options)
+                       putStrLn =<< helpStr prog usage (commonOptions prog usage [] ++ options)
                        exitSuccess)
     "Print help and exit."
   ]
   where header = do
           putStrLn $ "Futhark " ++ versionString
-          putStrLn "(C) HIPERFIT research centre"
-          putStrLn "Department of Computer Science, University of Copenhagen (DIKU)"
+          putStrLn "Copyright (C) DIKU, University of Copenhagen, released under the ISC license."
+          putStrLn "This is free software: you are free to change and redistribute it."
+          putStrLn "There is NO WARRANTY, to the extent permitted by law."

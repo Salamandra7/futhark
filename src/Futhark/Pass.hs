@@ -1,4 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE FlexibleContexts #-}
 -- | Definition of a polymorphic (generic) pass that can work with programs of any
 -- lore.
 module Futhark.Pass
@@ -8,26 +9,27 @@ module Futhark.Pass
        , liftEitherM
        , Pass (..)
        , passLongOption
-       , simplePass
+       , intraproceduralTransformation
        ) where
 
-import Control.Applicative
-import Control.Monad.Writer.Strict hiding (pass)
-import Control.Monad.Except
-import Control.Monad.State
+import Control.Monad.Writer.Strict
+import Control.Monad.Except hiding (liftEither)
+import Control.Monad.State.Strict
+import Control.Parallel.Strategies
 import Data.Char
-import qualified Data.Text as T
+import Data.Either
 
-import Prelude
+import Prelude hiding (log)
 
+import Futhark.Error
 import Futhark.Representation.AST
 import Futhark.Util.Log
 import Futhark.MonadFreshNames
 
 -- | The monad in which passes execute.
-newtype PassM a = PassM (ExceptT T.Text (WriterT Log (State VNameSource)) a)
+newtype PassM a = PassM (ExceptT InternalError (WriterT Log (State VNameSource)) a)
               deriving (Functor, Applicative, Monad,
-                        MonadError T.Text)
+                        MonadError InternalError)
 
 instance MonadLogger PassM where
   addLog = PassM . tell
@@ -39,14 +41,14 @@ instance MonadFreshNames PassM where
 -- | Execute a 'PassM' action, yielding logging information and either
 -- an error text or a result.
 runPassM :: MonadFreshNames m =>
-            PassM a -> m (Either T.Text a, Log)
+            PassM a -> m (Either InternalError a, Log)
 runPassM (PassM m) = modifyNameSource $ \src ->
   runState (runWriterT $ runExceptT m) src
 
 -- | Turn an 'Either' computation into a 'PassM'.  If the 'Either' is
--- 'Left', the result is an exception.
+-- 'Left', the result is a 'CompilerBug'.
 liftEither :: Show err => Either err a -> PassM a
-liftEither (Left e)  = throwError $ T.pack $ show e
+liftEither (Left e)  = compilerBugS $ show e
 liftEither (Right v) = return v
 
 -- | Turn an 'Either' monadic computation into a 'PassM'.  If the 'Either' is
@@ -74,12 +76,17 @@ passLongOption = map (spaceToDash . toLower) . passName
   where spaceToDash ' ' = '-'
         spaceToDash c   = c
 
--- | Turn a simple function on programs into a pass that cannot fail
--- and produces no log output.
-simplePass :: String -> String
-           -> (Prog fromlore -> State VNameSource (Prog tolore))
-           -> Pass fromlore tolore
-simplePass name desc f = Pass { passName = name
-                              , passDescription = desc
-                              , passFunction = modifyNameSource . runState . f
-                              }
+intraproceduralTransformation :: (FunDef fromlore -> PassM (FunDef tolore))
+                              -> Prog fromlore -> PassM (Prog tolore)
+intraproceduralTransformation ft prog =
+  either onError onSuccess <=< modifyNameSource $ \src ->
+  case partitionEithers $ parMap rpar (onFunction src) (progFunctions prog) of
+    ([], rs) -> let (funs, logs, srcs) = unzip3 rs
+                in (Right (Prog funs, mconcat logs), mconcat srcs)
+    ((err,log,src'):_, _) -> (Left (err, log), src')
+  where onFunction src f = case runState (runPassM (ft f)) src of
+          ((Left x, log), src') -> Left (x, log, src')
+          ((Right x, log), src') -> Right (x, log, src')
+
+        onError (err, log) = addLog log >> throwError err
+        onSuccess (x, log) = addLog log >> return x

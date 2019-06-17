@@ -4,7 +4,7 @@ C Porting Guide
 ===============
 
 This short document contains a collection of tips and tricks for
-porting simple numerical C code to futhark.  Futhark's sequential
+porting simple numerical C code to Futhark.  Futhark's sequential
 fragment is powerful enough to permit a rather straightforward
 translation of sequential C code that does not rely on pointer
 mutation.  Additionally, we provide hints on how to recognise C coding
@@ -63,7 +63,7 @@ case, a C assignment can generally be translated to just a
 function for computing the modular multiplicative inverse of a 16-bit
 unsigned integer (part of the IDEA encryption algorithm):
 
-.. code:: c
+.. code-block:: c
 
   static uint16_t ideaInv(uint16_t a) {
     uint32_t b;
@@ -110,25 +110,27 @@ change value from one iteration of the loop to the next will need to
 be maintained as *merge parameters* of the Futhark ``do``-loop.
 
 The Futhark program resulting from a straightforward port looks as
-follows::
+follows:
 
-  let main(a: u16): u16 =
+.. code-block:: futhark
+
+  let main(a: u16): u32 =
     let b = 0x10001u32
     let u = 0i32
-    let v = 1i32
-    loop ((a,b,u,v)) = while a > 0u16 do
-      let q = b / u32(a)
-      let r = b % u32(a)
+    let v = 1i32 in
+    let (_,_,u,_) = loop ((a,b,u,v)) while a > 0u16 do
+      let q = b / u32.u16(a)
+      let r = b % u32.u16(a)
 
-      let b = u32(a)
-      let a = u16(r)
+      let b = u32.u16(a)
+      let a = u16.u32(r)
 
       let t = v
-      let v = u - i32(q) * v
-      let u = t
-      in (a,b,u,v)
+      let v = u - i32.u32 (q) * v
+      let u = t in
+      (a,b,u,v)
 
-    in u16(if u < 0 then u + 0x10001 else u)
+    in u32.i32(if u < 0 then u + 0x10001 else u)
 
 Note the heavy use of type conversion and type suffixes for constants.
 This is necessary due to Futhark's lack of implicit conversions.  Note

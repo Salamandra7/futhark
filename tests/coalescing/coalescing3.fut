@@ -6,9 +6,8 @@
 --           [5i32, 5i32, 1i32, 10i32, 10i32, 1i32, 2i32],
 --           [4i32, 3i32, 6i32, 11i32, 1i32, 6i32, 1i32]] }
 
-let main(rss: *[#n][#m]i32): [][]i32 =
-  map (\(rs: *[]i32)  ->
-        loop (rs) = for i < m do
+let main [n][m] (rss: *[n][m]i32): [][]i32 =
+  map (\(rs: []i32)  ->
+        loop rs = copy rs for i < m do
           let rs[i] = rs[i] + 1
-          in rs
-        in rs) rss
+          in rs) rss

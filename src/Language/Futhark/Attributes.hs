@@ -17,54 +17,59 @@ module Language.Futhark.Attributes
   , valueType
   , leadingOperator
   , progImports
+  , decImports
+  , progModuleTypes
+  , identifierReference
+  , identifierReferences
 
   -- * Queries on expressions
   , typeOf
 
-  -- * Queries on patterns
-  , patNameSet
-  , patIdentSet
+  -- * Queries on patterns and params
+  , patternIdents
   , patternType
   , patternStructType
+  , patternPatternType
+  , patternParam
+  , patternOrderZero
+  , patternDimNames
 
   -- * Queries on types
   , uniqueness
   , unique
-  , recordArrayElemUniqueness
   , aliases
   , diet
-  , subtypeOf
-  , similarTo
   , arrayRank
-  , arrayDims
-  , arrayDims'
   , nestedDims
-  , nestedDims'
-  , arrayShape
-  , returnType
-  , lambdaReturnType
-  , concreteType
+  , orderZero
+  , unfoldFunType
+  , foldFunType
+  , typeVars
+  , typeDimNames
 
   -- * Operations on types
+  , rank
   , peelArray
+  , stripArray
   , arrayOf
-  , arrayType
   , toStructural
   , toStruct
   , fromStruct
   , setAliases
   , addAliases
   , setUniqueness
-  , modifyShapeAnnotations
-  , setArrayShape
   , removeShapeAnnotations
   , vacuousShapeAnnotations
-  , typeToRecordArrayElem
+  , anyDimShapeAnnotations
   , recordArrayElemToType
   , tupleRecord
   , isTupleRecord
   , areTupleFields
+  , tupleFieldNames
   , sortFields
+  , isTypeParam
+  , combineTypeShapes
+  , unscopeType
 
   -- | Values of these types are produces by the parser.  They use
   -- unadorned names and have no type information, apart from that
@@ -72,31 +77,33 @@ module Language.Futhark.Attributes
   , NoInfo(..)
   , UncheckedType
   , UncheckedTypeExp
-  , UncheckedArrayType
+  , UncheckedArrayElemType
   , UncheckedIdent
   , UncheckedTypeDecl
   , UncheckedDimIndex
   , UncheckedExp
   , UncheckedModExp
   , UncheckedSigExp
-  , UncheckedLambda
+  , UncheckedTypeParam
   , UncheckedPattern
-  , UncheckedFunBind
+  , UncheckedValBind
   , UncheckedDec
   , UncheckedProg
+  , UncheckedCase
   )
   where
 
-import           Control.Arrow           (second)
 import           Control.Monad.Writer
+import           Data.Char
 import           Data.Foldable
-import           Data.Hashable
 import qualified Data.Map.Strict       as M
-import qualified Data.Set            as S
+import qualified Data.Set              as S
 import           Data.List
 import           Data.Loc
 import           Data.Maybe
 import           Data.Ord
+import           Data.Bifunctor
+import           Data.Bifoldable
 
 import           Prelude
 
@@ -108,182 +115,66 @@ import qualified Futhark.Representation.Primitive as Primitive
 -- | Return the dimensionality of a type.  For non-arrays, this is
 -- zero.  For a one-dimensional array it is one, for a two-dimensional
 -- it is two, and so forth.
-arrayRank :: ArrayShape shape =>
-             TypeBase shape as -> Int
+arrayRank :: TypeBase dim as -> Int
 arrayRank = shapeRank . arrayShape
 
 -- | Return the shape of a type - for non-arrays, this is 'mempty'.
-arrayShape :: ArrayShape shape =>
-              TypeBase shape as -> shape
-arrayShape (Array (PrimArray _ ds _ _)) = ds
-arrayShape (Array (PolyArray _ ds _ _)) = ds
-arrayShape (Array (RecordArray _ ds _)) = ds
-arrayShape _                            = mempty
+arrayShape :: TypeBase dim as -> ShapeDecl dim
+arrayShape (Array _ _ _ ds) = ds
+arrayShape _ = mempty
 
--- | Return the shape of a type - for non-arrays, this is 'mempty'.
-arrayShape' :: TypeExp vn -> ShapeDecl vn
-arrayShape' (TEArray t d _) = ShapeDecl [d] <> arrayShape' t
-arrayShape' (TEUnique t _)  = arrayShape' t
-arrayShape' _               = mempty
-
--- | Return the dimensions of a type with (possibly) known dimensions.
-arrayDims :: Ord vn => TypeBase (ShapeDecl vn) as -> [Maybe (DimDecl vn)]
-arrayDims = shapeDims . arrayShape
-
--- | Return the dimensions of a type with (possibly) known dimensions.
-arrayDims' :: TypeExp vn -> [Maybe (DimDecl vn)]
-arrayDims' = shapeDims . arrayShape'
-
--- | Return any shape declaration in the type, with duplicates removed.
-nestedDims :: Ord vn => TypeBase (ShapeDecl vn) as -> [DimDecl vn]
+-- | Return any shape declarations in the type, with duplicates
+-- removed.
+nestedDims :: TypeBase (DimDecl VName) as -> [DimDecl VName]
 nestedDims t =
-  case t of Array a   -> nub $ arrayNestedDims a
-            Record fs -> nub $ fold $ fmap nestedDims fs
-            Prim{}    -> mempty
-            TypeVar{} -> mempty
-  where arrayNestedDims (PrimArray _ ds _ _) =
-          catMaybes $ shapeDims ds
-        arrayNestedDims (PolyArray _ ds _ _) =
-          catMaybes $ shapeDims ds
-        arrayNestedDims (RecordArray ts ds _) =
-          catMaybes (shapeDims ds) <> fold (fmap recordArrayElemNestedDims ts)
-        recordArrayElemNestedDims (ArrayArrayElem a) =
-          arrayNestedDims a
-        recordArrayElemNestedDims (RecordArrayElem fs) =
-          fold $ fmap recordArrayElemNestedDims fs
-        recordArrayElemNestedDims PrimArrayElem{} =
+  case t of Array _ _ a ds      -> nub $ arrayNestedDims a <> shapeDims ds
+            Record fs           -> nub $ fold $ fmap nestedDims fs
+            Prim{}              -> mempty
+            TypeVar _ _ _ targs -> concatMap typeArgDims targs
+            Arrow _ v t1 t2     -> filter (notV v) $ nestedDims t1 <> nestedDims t2
+            Enum{}              -> []
+  where arrayNestedDims ArrayPrimElem{} =
           mempty
-        recordArrayElemNestedDims PolyArrayElem{} =
-          mempty
+        arrayNestedDims (ArrayPolyElem _ targs) =
+          concatMap typeArgDims targs
+        arrayNestedDims (ArrayRecordElem ts) =
+          fold (fmap recordArrayElemNestedDims ts)
+        arrayNestedDims ArrayEnumElem{} = mempty
 
--- | Return any shape declaration in the type, with duplicates removed.
-nestedDims' :: Ord vn => TypeExp vn -> [DimDecl vn]
-nestedDims' (TEArray t (Just d) _) = nub $ d : nestedDims' t
-nestedDims' (TEArray t Nothing _)  = nestedDims' t
-nestedDims' (TETuple ts _)         = nub $ mconcat $ map nestedDims' ts
-nestedDims' (TEUnique t _)         = nestedDims' t
-nestedDims' _                      = mempty
+        recordArrayElemNestedDims (RecordArrayArrayElem a ds) =
+          arrayNestedDims a <> shapeDims ds
+        recordArrayElemNestedDims (RecordArrayElem et) =
+          arrayNestedDims et
 
--- | Set the dimensions of an array.  If the given type is not an
--- array, return the type unchanged.
-setArrayShape :: TypeBase shape as -> shape -> TypeBase shape as
-setArrayShape (Array (PrimArray et _ u as)) ds = Array $ PrimArray et ds u as
-setArrayShape (Array (PolyArray v _ u as))  ds = Array $ PolyArray v ds u as
-setArrayShape (Array (RecordArray et _ u))  ds = Array $ RecordArray et ds u
-setArrayShape (Record ts)                   _  = Record ts
-setArrayShape (Prim t)                      _  = Prim t
-setArrayShape (TypeVar x)                   _  = TypeVar x
+        typeArgDims (TypeArgDim d _) = [d]
+        typeArgDims (TypeArgType at _) = nestedDims at
+
+        notV Nothing  = const True
+        notV (Just v) = (/=NamedDim (qualName v))
 
 -- | Change the shape of a type to be just the 'Rank'.
-removeShapeAnnotations :: ArrayShape shape =>
-                          TypeBase shape as -> TypeBase Rank as
-removeShapeAnnotations = modifyShapeAnnotations $ Rank . shapeRank
+removeShapeAnnotations :: TypeBase (DimDecl vn) as -> TypeBase () as
+removeShapeAnnotations = modifyShapeAnnotations $ const ()
 
--- | Change the shape of a type to be a 'ShapeDecl' where all
--- dimensions are 'Nothing'.
-vacuousShapeAnnotations :: ArrayShape shape =>
-                           TypeBase shape as -> TypeBase (ShapeDecl vn) as
-vacuousShapeAnnotations = modifyShapeAnnotations $ \shape ->
-  ShapeDecl (replicate (shapeRank shape) Nothing)
+-- | Add size annotations that are all 'AnyDim'.
+vacuousShapeAnnotations :: TypeBase () as -> TypeBase (DimDecl vn) as
+vacuousShapeAnnotations = modifyShapeAnnotations $ const AnyDim
 
--- | Change the shape of a type.
+-- | Change all size annotations to be 'AnyDim'.
+anyDimShapeAnnotations :: TypeBase (DimDecl vn) as -> TypeBase (DimDecl vn) as
+anyDimShapeAnnotations = modifyShapeAnnotations $ const AnyDim
+
+-- | Change the size annotations of a type.
 modifyShapeAnnotations :: (oldshape -> newshape)
                        -> TypeBase oldshape as
                        -> TypeBase newshape as
-modifyShapeAnnotations f (Array at) =
-  Array $ modifyShapeAnnotationsFromArray f at
-modifyShapeAnnotations f (Record ts) =
-  Record $ fmap (modifyShapeAnnotations f) ts
-modifyShapeAnnotations _ (Prim t) =
-  Prim t
-modifyShapeAnnotations _ (TypeVar x) =
-  TypeVar x
-
-modifyShapeAnnotationsFromArray :: (oldshape -> newshape)
-                                -> ArrayTypeBase oldshape as
-                                -> ArrayTypeBase newshape as
-modifyShapeAnnotationsFromArray f (PrimArray et shape u as) =
-  PrimArray et (f shape) u as
-modifyShapeAnnotationsFromArray f (PolyArray et shape u as) =
-  PolyArray et (f shape) u as
-modifyShapeAnnotationsFromArray f (RecordArray ts shape u) =
-  RecordArray
-  (fmap (modifyShapeAnnotationsFromRecordArrayElem f) ts)
-  (f shape) u
-
--- Try saying this one three times fast.
-modifyShapeAnnotationsFromRecordArrayElem :: (oldshape -> newshape)
-                                          -> RecordArrayElemTypeBase oldshape as
-                                          -> RecordArrayElemTypeBase newshape as
-modifyShapeAnnotationsFromRecordArrayElem
-  _ (PrimArrayElem bt as u) = PrimArrayElem bt as u
-modifyShapeAnnotationsFromRecordArrayElem
-  _ (PolyArrayElem bt as u) = PolyArrayElem bt as u
-modifyShapeAnnotationsFromRecordArrayElem
-  f (ArrayArrayElem at) = ArrayArrayElem $ modifyShapeAnnotationsFromArray f at
-modifyShapeAnnotationsFromRecordArrayElem
-  f (RecordArrayElem ts) = RecordArrayElem $ fmap (modifyShapeAnnotationsFromRecordArrayElem f) ts
-
--- | @x `subuniqueOf` y@ is true if @x@ is not less unique than @y@.
-subuniqueOf :: Uniqueness -> Uniqueness -> Bool
-subuniqueOf Nonunique Unique = False
-subuniqueOf _ _              = True
-
--- | @x \`subtypeOf\` y@ is true if @x@ is a subtype of @y@ (or equal to
--- @y@), meaning @x@ is valid whenever @y@ is.
-subtypeOf :: ArrayShape shape =>
-             TypeBase shape as1 -> TypeBase shape as2 -> Bool
-subtypeOf
-  (Array (PrimArray t1 dims1 u1 _))
-  (Array (PrimArray t2 dims2 u2 _)) =
-  u1 `subuniqueOf` u2 &&
-  t1 == t2 &&
-  dims1 == dims2
-subtypeOf
-  (Array (PolyArray t1 dims1 u1 _))
-  (Array (PolyArray t2 dims2 u2 _)) =
-  u1 `subuniqueOf` u2 &&
-  t1 == t2 &&
-  dims1 == dims2
-subtypeOf
-  (Array (RecordArray et1 dims1 u1))
-  (Array (RecordArray et2 dims2 u2)) =
-  and [sort (M.keys et1) == sort (M.keys et2),
-       u1 `subuniqueOf` u2,
-       length et1 == length et2,
-       and (M.intersectionWith subtypeOf
-            (fmap recordArrayElemToType et1)
-            (fmap recordArrayElemToType et2)),
-       dims1 == dims2]
-subtypeOf (Record ts1) (Record ts2) =
-  sort (M.keys ts1) == sort (M.keys ts2) &&
-  length ts1 == length ts2 && and (M.intersectionWith subtypeOf ts1 ts2)
-subtypeOf (Prim bt1) (Prim bt2) = bt1 == bt2
-subtypeOf (TypeVar v1) (TypeVar v2) = v1 == v2
-subtypeOf _ _ = False
-
--- | @x \`similarTo\` y@ is true if @x@ and @y@ are the same type,
--- ignoring uniqueness.
-similarTo :: ArrayShape shape =>
-             TypeBase shape as1
-          -> TypeBase shape as2
-          -> Bool
-similarTo t1 t2 = t1 `subtypeOf` t2 || t2 `subtypeOf` t1
+modifyShapeAnnotations f = bimap f id
 
 -- | Return the uniqueness of a type.
 uniqueness :: TypeBase shape as -> Uniqueness
-uniqueness (Array (PrimArray _ _ u _)) = u
-uniqueness (Array (PolyArray _ _ u _)) = u
-uniqueness (Array (RecordArray _ _ u)) = u
-uniqueness _                           = Nonunique
-
-recordArrayElemUniqueness :: RecordArrayElemTypeBase shape as -> Uniqueness
-recordArrayElemUniqueness (PrimArrayElem _ _ u) = u
-recordArrayElemUniqueness (PolyArrayElem _ _ u) = u
-recordArrayElemUniqueness (ArrayArrayElem (PrimArray _ _ u _)) = u
-recordArrayElemUniqueness (ArrayArrayElem (PolyArray _ _ u _)) = u
-recordArrayElemUniqueness (ArrayArrayElem (RecordArray _ _ u)) = u
-recordArrayElemUniqueness (RecordArrayElem ts) = fold $ fmap recordArrayElemUniqueness ts
+uniqueness (Array _ u _ _) = u
+uniqueness (TypeVar _ u _ _) = u
+uniqueness _ = Nonunique
 
 -- | @unique t@ is 'True' if the type of the argument is unique.
 unique :: TypeBase shape as -> Bool
@@ -292,183 +183,140 @@ unique = (==Unique) . uniqueness
 -- | Return the set of all variables mentioned in the aliasing of a
 -- type.
 aliases :: Monoid as => TypeBase shape as -> as
-aliases (Array (PrimArray _ _ _ als)) = als
-aliases (Array (PolyArray _ _ _ als)) = als
-aliases (Array (RecordArray ts _ _))  = fold $ fmap recordArrayElemAliases ts
-aliases (Record et)                   = fold $ fmap aliases et
-aliases (Prim _)                      = mempty
-aliases (TypeVar _)                   = mempty
-
-recordArrayElemAliases :: Monoid as =>
-                         RecordArrayElemTypeBase shape as -> as
-recordArrayElemAliases (PrimArrayElem _ als _) = als
-recordArrayElemAliases (PolyArrayElem _ als _) = als
-recordArrayElemAliases (ArrayArrayElem (PrimArray _ _ _ als)) =
-  als
-recordArrayElemAliases (ArrayArrayElem (PolyArray _ _ _ als)) =
-  als
-recordArrayElemAliases (ArrayArrayElem (RecordArray ts _ _)) =
-  fold $ M.map recordArrayElemAliases ts
-recordArrayElemAliases (RecordArrayElem ts) =
-  fold $ M.map recordArrayElemAliases ts
+aliases = bifoldMap (const mempty) id
 
 -- | @diet t@ returns a description of how a function parameter of
 -- type @t@ might consume its argument.
 diet :: TypeBase shape as -> Diet
-diet (Record ets)                        = RecordDiet $ fmap diet ets
-diet (Prim _)                            = Observe
-diet (TypeVar _)                         = Observe
-diet (Array (PrimArray _ _ Unique _))    = Consume
-diet (Array (PrimArray _ _ Nonunique _)) = Observe
-diet (Array (PolyArray _ _ Unique _))    = Consume
-diet (Array (PolyArray _ _ Nonunique _)) = Observe
-diet (Array (RecordArray _ _ Unique))    = Consume
-diet (Array (RecordArray _ _ Nonunique)) = Observe
-
--- | @t `maskAliases` d@ removes aliases (sets them to 'mempty') from
--- the parts of @t@ that are denoted as 'Consumed' by the 'Diet' @d@.
-maskAliases :: Monoid as =>
-               TypeBase shape as
-            -> Diet
-            -> TypeBase shape as
-maskAliases t Consume = t `setAliases` mempty
-maskAliases t Observe = t
-maskAliases (Record ets) (RecordDiet ds) =
-  Record $ M.intersectionWith maskAliases ets ds
-maskAliases _ _ = error "Invalid arguments passed to maskAliases."
+diet (Record ets)            = RecordDiet $ fmap diet ets
+diet (Prim _)                = Observe
+diet TypeVar{}               = Observe
+diet (Arrow _ _ t1 t2)       = FuncDiet (diet t1) (diet t2)
+diet (Array _ Unique _ _)    = Consume
+diet (Array _ Nonunique _ _) = Observe
+diet (Enum _)                = Observe
 
 -- | Convert any type to one that has rank information, no alias
 -- information, and no embedded names.
-toStructural :: ArrayShape shape =>
-                TypeBase shape as
-             -> TypeBase Rank ()
-toStructural = removeNames . removeShapeAnnotations
+toStructural :: TypeBase dim as
+             -> TypeBase () ()
+toStructural = flip setAliases () . modifyShapeAnnotations (const ())
 
 -- | Remove aliasing information from a type.
-toStruct :: TypeBase shape as
-         -> TypeBase shape ()
+toStruct :: TypeBase dim as
+         -> TypeBase dim ()
 toStruct t = t `setAliases` ()
 
 -- | Replace no aliasing with an empty alias set.
-fromStruct :: TypeBase shape as
-           -> TypeBase shape (Names vn)
+fromStruct :: TypeBase dim as
+           -> TypeBase dim Aliasing
 fromStruct t = t `setAliases` S.empty
 
 -- | @peelArray n t@ returns the type resulting from peeling the first
 -- @n@ array dimensions from @t@.  Returns @Nothing@ if @t@ has less
 -- than @n@ dimensions.
-peelArray :: ArrayShape shape =>
-             Int -> TypeBase shape as -> Maybe (TypeBase shape as)
+peelArray :: Int -> TypeBase dim as -> Maybe (TypeBase dim as)
 peelArray 0 t = Just t
-peelArray n (Array (PrimArray et shape _ _))
+peelArray n (Array _ _ (ArrayPrimElem et) shape)
   | shapeRank shape == n =
     Just $ Prim et
-peelArray n (Array (PolyArray et shape _ _))
+peelArray n (Array als u (ArrayPolyElem et targs) shape)
   | shapeRank shape == n =
-    Just $ TypeVar et
-peelArray n (Array (RecordArray ts shape _))
+    Just $ TypeVar als u et targs
+peelArray n (Array als u (ArrayRecordElem ts) shape)
   | shapeRank shape == n =
     Just $ Record $ fmap asType ts
-  where asType (PrimArrayElem bt _ _) = Prim bt
-        asType (PolyArrayElem bt _ _) = TypeVar bt
-        asType (ArrayArrayElem at)    = Array at
-        asType (RecordArrayElem ts')  = Record $ fmap asType ts'
-peelArray n (Array (PrimArray et shape u als)) = do
+  where asType (RecordArrayElem (ArrayPrimElem bt)) = Prim bt
+        asType (RecordArrayElem (ArrayPolyElem bt targs)) = TypeVar als u bt targs
+        asType (RecordArrayElem (ArrayRecordElem ts')) = Record $ fmap asType ts'
+        asType (RecordArrayElem (ArrayEnumElem cs)) = Enum cs
+        asType (RecordArrayArrayElem et e_shape) = Array als u et e_shape
+peelArray n (Array _ _ (ArrayEnumElem cs) shape)
+  | shapeRank shape == n =
+    Just $ Enum cs
+peelArray n (Array als u et shape) = do
   shape' <- stripDims n shape
-  return $ Array $ PrimArray et shape' u als
-peelArray n (Array (PolyArray et shape u als)) = do
-  shape' <- stripDims n shape
-  return $ Array $ PolyArray et shape' u als
-peelArray n (Array (RecordArray et shape u)) = do
-  shape' <- stripDims n shape
-  return $ Array $ RecordArray et shape' u
+  return $ Array als u et shape'
 peelArray _ _ = Nothing
-
--- | Remove names from a type - this involves removing all size
--- annotations from arrays, as well as all aliasing.
-removeNames :: ArrayShape shape =>
-               TypeBase shape as
-            -> TypeBase Rank ()
-removeNames = flip setAliases () . removeShapeAnnotations
 
 -- | @arrayOf t s u@ constructs an array type.  The convenience
 -- compared to using the 'Array' constructor directly is that @t@ can
 -- itself be an array.  If @t@ is an @n@-dimensional array, and @s@ is
 -- a list of length @n@, the resulting type is of an @n+m@ dimensions.
 -- The uniqueness of the new array will be @u@, no matter the
--- uniqueness of @t@.
-arrayOf :: (ArrayShape shape, Monoid as) =>
-           TypeBase shape as
-        -> shape
+-- uniqueness of @t@.  The function returns 'Nothing' in case an
+-- attempt is made to create an array of functions.
+arrayOf :: Monoid as =>
+           TypeBase dim as
+        -> ShapeDecl dim
         -> Uniqueness
-        -> TypeBase shape as
-arrayOf (Array (PrimArray et shape1 _ als)) shape2 u =
-  Array $ PrimArray et (shape2 <> shape1) u als
-arrayOf (Array (PolyArray et shape1 _ als)) shape2 u =
-  Array $ PolyArray et (shape2 <> shape1) u als
-arrayOf (Array (RecordArray et shape1 _)) shape2 u =
-  Array $ RecordArray et (shape2 <> shape1) u
-arrayOf (Prim et) shape u =
-  Array $ PrimArray et shape u mempty
-arrayOf (TypeVar x) shape u =
-  Array $ PolyArray x shape u mempty
-arrayOf (Record ts) shape u =
-  Array $ RecordArray (fmap (`typeToRecordArrayElem` u) ts) shape u
+        -> Maybe (TypeBase dim as)
+arrayOf t = arrayOfWithAliases t mempty
+
+arrayOfWithAliases :: Monoid as =>
+                      TypeBase dim as
+                   -> as
+                   -> ShapeDecl dim
+                   -> Uniqueness
+                   -> Maybe (TypeBase dim as)
+arrayOfWithAliases (Array as1 _ et shape1) as2 shape2 u =
+  Just $ Array (as1<>as2) u et (shape2 <> shape1)
+arrayOfWithAliases (Prim et) as shape u =
+  Just $ Array as u (ArrayPrimElem et) shape
+arrayOfWithAliases (TypeVar _ _ x targs) as shape u =
+  Just $ Array as u (ArrayPolyElem x targs) shape
+arrayOfWithAliases (Record ts) as shape u = do
+  ts' <- traverse typeToRecordArrayElem ts
+  return $ Array as u (ArrayRecordElem ts') shape
+arrayOfWithAliases Arrow{} _ _ _ = Nothing
+arrayOfWithAliases (Enum cs) as shape u  =
+  Just $ Array as u (ArrayEnumElem cs) shape
 
 typeToRecordArrayElem :: Monoid as =>
-                        TypeBase shape as
-                     -> Uniqueness
-                     -> RecordArrayElemTypeBase shape as
-typeToRecordArrayElem (Prim bt)    u = PrimArrayElem bt mempty u
-typeToRecordArrayElem (TypeVar bt) u = PolyArrayElem bt mempty u
-typeToRecordArrayElem (Record ts') u = RecordArrayElem $ fmap (`typeToRecordArrayElem` u) ts'
-typeToRecordArrayElem (Array at)   _ = ArrayArrayElem at
+                         TypeBase dim as -> Maybe (RecordArrayElemTypeBase dim)
+typeToRecordArrayElem (Prim bt) =
+  Just $ RecordArrayElem $ ArrayPrimElem bt
+typeToRecordArrayElem (TypeVar _ _ bt targs) =
+  Just $ RecordArrayElem $ ArrayPolyElem bt targs
+typeToRecordArrayElem (Record ts') =
+  RecordArrayElem . ArrayRecordElem <$>
+  traverse typeToRecordArrayElem ts'
+typeToRecordArrayElem (Array _ _ et shape) =
+  Just $ RecordArrayArrayElem et shape
+typeToRecordArrayElem Arrow{} = Nothing
+typeToRecordArrayElem (Enum cs) =
+  Just $ RecordArrayElem $ ArrayEnumElem cs
 
-recordArrayElemToType :: RecordArrayElemTypeBase shape as
-                     -> TypeBase shape as
-recordArrayElemToType (PrimArrayElem bt _ _) = Prim bt
-recordArrayElemToType (PolyArrayElem bt _ _) = TypeVar bt
-recordArrayElemToType (RecordArrayElem ts)   = Record $ fmap recordArrayElemToType ts
-recordArrayElemToType (ArrayArrayElem at)    = Array at
+recordArrayElemToType :: Monoid as =>
+                         RecordArrayElemTypeBase dim
+                      -> TypeBase dim as
+recordArrayElemToType (RecordArrayElem et)              = arrayElemToType et
+recordArrayElemToType (RecordArrayArrayElem et shape) = Array mempty Nonunique et shape
 
--- | @arrayType n t@ is the type of @n@-dimensional arrays having @t@ as
--- the base type.  If @t@ is itself an m-dimensional array, the result
--- is an @n+m@-dimensional array with the same base type as @t@.  If
--- you need to specify size information for the array, use 'arrayOf'
--- instead.
-arrayType :: (ArrayShape shape, Monoid as) =>
-             Int
-          -> TypeBase shape as
-          -> Uniqueness
-          -> TypeBase Rank as
-arrayType 0 t _ = removeShapeAnnotations t
-arrayType n t u = arrayOf (removeShapeAnnotations t) (Rank n) u
+arrayElemToType :: Monoid as => ArrayElemTypeBase dim -> TypeBase dim as
+arrayElemToType (ArrayPolyElem bt targs) =
+  TypeVar mempty Nonunique bt targs
+arrayElemToType (ArrayRecordElem ts) =
+  Record $ fmap recordArrayElemToType ts
+arrayElemToType (ArrayPrimElem bt) = Prim bt
+arrayElemToType (ArrayEnumElem cs) = Enum cs
 
 -- | @stripArray n t@ removes the @n@ outermost layers of the array.
 -- Essentially, it is the type of indexing an array of type @t@ with
 -- @n@ indexes.
-stripArray :: ArrayShape shape =>
-              Int -> TypeBase shape as -> TypeBase shape as
-stripArray n (Array (PrimArray et shape u als))
+stripArray :: Monoid as => Int -> TypeBase dim as -> TypeBase dim as
+stripArray n (Array als u et shape)
   | Just shape' <- stripDims n shape =
-    Array $ PrimArray et shape' u als
-  | otherwise = Prim et
-stripArray n (Array (PolyArray et shape u als))
-  | Just shape' <- stripDims n shape =
-    Array $ PolyArray et shape' u als
-  | otherwise = TypeVar et
-stripArray n (Array (RecordArray fs shape u))
-  | Just shape' <- stripDims n shape =
-    Array $ RecordArray fs shape' u
-  | otherwise = Record $ fmap recordArrayElemToType fs
+    Array als u et shape'
+  | otherwise = arrayElemToType et `setUniqueness` u `addAliases` (<>als)
 stripArray _ t = t
 
 -- | Create a record type corresponding to a tuple with the given
 -- element types.
-tupleRecord :: [TypeBase shape as] -> TypeBase shape as
+tupleRecord :: [TypeBase dim as] -> TypeBase dim as
 tupleRecord = Record . M.fromList . zip tupleFieldNames
 
-isTupleRecord :: TypeBase shape as -> Maybe [TypeBase shape as]
+isTupleRecord :: TypeBase dim as -> Maybe [TypeBase dim as]
 isTupleRecord (Record fs) = areTupleFields fs
 isTupleRecord _ = Nothing
 
@@ -487,81 +335,71 @@ tupleFieldNames = map (nameFromString . show) [(1::Int)..]
 -- their numeric value.  This ensures that tuples and tuple-like
 -- records match.
 sortFields :: M.Map Name a -> [(Name,a)]
-sortFields l = map snd $ sortBy (comparing fst) $ zip (map (fieldish . fst) l') l'
+sortFields l = map snd $ sortOn fst $ zip (map (fieldish . fst) l') l'
   where l' = M.toList l
         fieldish s = case reads $ nameToString s of
           [(x, "")] -> Left (x::Int)
           _         -> Right s
 
+isTypeParam :: TypeParamBase vn -> Bool
+isTypeParam TypeParamType{}       = True
+isTypeParam TypeParamDim{}        = False
+
+-- | Combine the shape information of types as much as possible. The first
+-- argument is the orignal type and the second is the type of the transformed
+-- expression. This is necessary since the original type may contain additional
+-- information (e.g., shape restrictions) from the user given annotation.
+combineTypeShapes :: (Monoid as, ArrayDim dim) =>
+                     TypeBase dim as -> TypeBase dim as -> TypeBase dim as
+combineTypeShapes (Record ts1) (Record ts2)
+  | M.keys ts1 == M.keys ts2 =
+      Record $ M.map (uncurry combineTypeShapes) (M.intersectionWith (,) ts1 ts2)
+combineTypeShapes (Array als1 u1 et1 shape1) (Array als2 _u2 et2 shape2)
+  | Just new_shape <- unifyShapes shape1 shape2 =
+      Array (als1<>als2) u1 (combineElemTypeInfo et1 et2) new_shape
+combineTypeShapes _ new_tp = new_tp
+
+combineElemTypeInfo :: ArrayDim dim =>
+                       ArrayElemTypeBase dim
+                    -> ArrayElemTypeBase dim -> ArrayElemTypeBase dim
+combineElemTypeInfo (ArrayRecordElem et1) (ArrayRecordElem et2) =
+  ArrayRecordElem $ M.map (uncurry combineRecordArrayTypeInfo)
+                          (M.intersectionWith (,) et1 et2)
+combineElemTypeInfo _ new_tp = new_tp
+
+combineRecordArrayTypeInfo :: ArrayDim dim =>
+                              RecordArrayElemTypeBase dim
+                           -> RecordArrayElemTypeBase dim
+                           -> RecordArrayElemTypeBase dim
+combineRecordArrayTypeInfo (RecordArrayElem et1) (RecordArrayElem et2) =
+  RecordArrayElem $ combineElemTypeInfo et1 et2
+combineRecordArrayTypeInfo (RecordArrayArrayElem et1 shape1)
+                           (RecordArrayArrayElem et2 shape2)
+  | Just new_shape <- unifyShapes shape1 shape2 =
+      RecordArrayArrayElem (combineElemTypeInfo et1 et2) new_shape
+combineRecordArrayTypeInfo _ new_tp = new_tp
 
 -- | Set the uniqueness attribute of a type.  If the type is a tuple,
 -- the uniqueness of its components will be modified.
-setUniqueness :: TypeBase shape as -> Uniqueness -> TypeBase shape as
-setUniqueness (Array at) u =
-  Array $ setArrayUniqueness at u
+setUniqueness :: TypeBase dim as -> Uniqueness -> TypeBase dim as
+setUniqueness (Array als _ et shape) u =
+  Array als u et shape
+setUniqueness (TypeVar als _ t targs) u =
+  TypeVar als u t targs
 setUniqueness (Record ets) u =
   Record $ fmap (`setUniqueness` u) ets
 setUniqueness t _ = t
 
-setArrayUniqueness :: ArrayTypeBase shape as -> Uniqueness
-                   -> ArrayTypeBase shape as
-setArrayUniqueness (PrimArray et dims _ als) u =
-  PrimArray et dims u als
-setArrayUniqueness (PolyArray et dims _ als) u =
-  PolyArray et dims u als
-setArrayUniqueness (RecordArray et dims _) u =
-  RecordArray (fmap (`setRecordArrayElemUniqueness` u) et) dims u
-
-setRecordArrayElemUniqueness :: RecordArrayElemTypeBase shape as -> Uniqueness
-                            -> RecordArrayElemTypeBase shape as
-setRecordArrayElemUniqueness (PrimArrayElem bt als _) u =
-  PrimArrayElem bt als u
-setRecordArrayElemUniqueness (PolyArrayElem bt als _) u =
-  PolyArrayElem bt als u
-setRecordArrayElemUniqueness (ArrayArrayElem at) u =
-  ArrayArrayElem $ setArrayUniqueness at u
-setRecordArrayElemUniqueness (RecordArrayElem ts) u =
-  RecordArrayElem $ fmap (`setRecordArrayElemUniqueness` u) ts
-
 -- | @t \`setAliases\` als@ returns @t@, but with @als@ substituted for
 -- any already present aliasing.
-setAliases :: TypeBase shape asf -> ast -> TypeBase shape ast
+setAliases :: TypeBase dim asf -> ast -> TypeBase dim ast
 setAliases t = addAliases t . const
 
 -- | @t \`addAliases\` f@ returns @t@, but with any already present
 -- aliasing replaced by @f@ applied to that aliasing.
-addAliases :: TypeBase shape asf -> (asf -> ast)
-           -> TypeBase shape ast
-addAliases (Array at) f =
-  Array $ addArrayAliases at f
-addAliases (Record ts) f =
-  Record $ fmap (`addAliases` f) ts
-addAliases (Prim et) _ =
-  Prim et
-addAliases (TypeVar et) _ =
-  TypeVar et
-
-addArrayAliases :: ArrayTypeBase shape asf
-                -> (asf -> ast)
-                -> ArrayTypeBase shape ast
-addArrayAliases (PrimArray et dims u als) f =
-  PrimArray et dims u $ f als
-addArrayAliases (PolyArray et dims u als) f =
-  PolyArray et dims u $ f als
-addArrayAliases (RecordArray et dims u) f =
-  RecordArray (fmap (`addRecordArrayElemAliases` f) et) dims u
-
-addRecordArrayElemAliases :: RecordArrayElemTypeBase shape asf
-                         -> (asf -> ast)
-                         -> RecordArrayElemTypeBase shape ast
-addRecordArrayElemAliases (PrimArrayElem bt als u) f =
-  PrimArrayElem bt (f als) u
-addRecordArrayElemAliases (PolyArrayElem bt als u) f =
-  PolyArrayElem bt (f als) u
-addRecordArrayElemAliases (ArrayArrayElem at) f =
-  ArrayArrayElem $ addArrayAliases at f
-addRecordArrayElemAliases (RecordArrayElem ts) f =
-  RecordArrayElem $ fmap (`addRecordArrayElemAliases` f) ts
+addAliases :: TypeBase dim asf -> (asf -> ast)
+           -> TypeBase dim ast
+addAliases t f = bimap id f t
 
 intValueType :: IntValue -> IntType
 intValueType Int8Value{}  = Int8
@@ -580,223 +418,193 @@ primValueType (UnsignedValue v) = Unsigned $ intValueType v
 primValueType (FloatValue v)    = FloatType $ floatValueType v
 primValueType BoolValue{}       = Bool
 
-valueType :: Value -> TypeBase Rank ()
+valueType :: Value -> TypeBase () ()
 valueType (PrimValue bv) = Prim $ primValueType bv
-valueType (ArrayValue _ (Prim et)) =
-  Array $ PrimArray et (Rank 1) Nonunique ()
-valueType (ArrayValue _ (TypeVar et)) =
-  Array $ PolyArray et (Rank 1) Nonunique ()
-valueType (ArrayValue _ (Record fs)) =
-  Array $ RecordArray (fmap (`typeToRecordArrayElem` Nonunique) fs) (Rank 1) Nonunique
-valueType (ArrayValue _ (Array (PrimArray et shape _ _))) =
-  Array $ PrimArray et (Rank $ 1 + shapeRank shape) Nonunique ()
-valueType (ArrayValue _ (Array (PolyArray et shape _ _))) =
-  Array $ PolyArray et (Rank $ 1 + shapeRank shape) Nonunique ()
-valueType (ArrayValue _ (Array (RecordArray et shape _))) =
-  Array $ RecordArray et (Rank $ 1 + shapeRank shape) Nonunique
+valueType (ArrayValue _ t) = t
+
+-- | Construct a 'ShapeDecl' with the given number of zero-information
+-- dimensions.
+rank :: Int -> ShapeDecl ()
+rank n = ShapeDecl $ replicate n ()
+
+-- | The type is leaving a scope, so clean up any aliases that
+-- reference the bound variables, and turn any dimensions that name
+-- them into AnyDim instead.
+unscopeType :: S.Set VName -> PatternType -> PatternType
+unscopeType bound_here t = modifyShapeAnnotations onDim $ t `addAliases` S.map unbind
+  where unbind (AliasBound v) | v `S.member` bound_here = AliasFree v
+        unbind a = a
+        onDim (NamedDim qn) | qualLeaf qn `S.member` bound_here = AnyDim
+        onDim d = d
 
 -- | The type of an Futhark term.  The aliasing will refer to itself, if
 -- the term is a non-tuple-typed variable.
-typeOf :: (Ord vn, Hashable vn) => ExpBase Info vn -> CompTypeBase vn
+typeOf :: ExpBase Info VName -> PatternType
 typeOf (Literal val _) = Prim $ primValueType val
+typeOf (IntLit _ (Info t) _) = t
+typeOf (FloatLit _ (Info t) _) = t
 typeOf (Parens e _) = typeOf e
+typeOf (QualParens _ e _) = typeOf e
 typeOf (TupLit es _) = tupleRecord $ map typeOf es
 typeOf (RecordLit fs _) =
   -- Reverse, because M.unions is biased to the left.
   Record $ M.unions $ reverse $ map record fs
-  where record (RecordField name e _) = M.singleton name $ typeOf e
-        record (RecordRecord e) = case typeOf e of
-          Record rfs -> rfs
-          _          -> error "typeOf: RecordLit: the impossible happened."
-typeOf (ArrayLit es (Info t) _) =
-  arrayType 1 t $ mconcat $ map (uniqueness . typeOf) es
-typeOf (Empty (TypeDecl _ (Info t)) _) =
-  arrayType 1 (fromStruct t) Unique
-typeOf (BinOp _ _ _ (Info t) _) = t
+  where record (RecordFieldExplicit name e _) = M.singleton name $ typeOf e
+        record (RecordFieldImplicit name (Info t) _) =
+          M.singleton (baseName name) $ t
+          `addAliases` S.insert (AliasBound name)
+typeOf (ArrayLit _ (Info t) _) = t
+typeOf (Range _ _ _ (Info t) _) = t
+typeOf (BinOp _ _ _ _ (Info t) _) = t
 typeOf (Project _ _ (Info t) _) = t
 typeOf (If _ _ _ (Info t) _) = t
-typeOf (Var _ (Info (Record ets)) _) = Record ets
-typeOf (Var qn (Info t) _) = t `addAliases` S.insert (qualLeaf qn)
-typeOf (Ascript e _ _) = typeOf e
-typeOf (Apply _ _ (Info t) _) = t
+typeOf (Var _ (Info t) _) = t
+typeOf (Ascript _ _ (Info t) _) = t
+typeOf (Apply _ _ _ (Info t) _) = t
 typeOf (Negate e _) = typeOf e
-typeOf (LetPat _ _ body _) = typeOf body
+typeOf (LetPat _ _ _ (Info t) _) = t
 typeOf (LetFun _ _ body _) = typeOf body
-typeOf (LetWith _ _ _ _ body _) = typeOf body
-typeOf (Index ident idx _) =
-  stripArray (length $ filter isFix idx) (typeOf ident)
-  where isFix DimFix{} = True
-        isFix _        = False
-typeOf (Update e _ _ _) = typeOf e
-typeOf (Iota e _) = arrayType 1 (typeOf e) Unique
-typeOf (Shape _ _) = Array $ PrimArray (Signed Int32) (Rank 1) Unique mempty
-typeOf (Replicate _ e _) = arrayType 1 (typeOf e) Unique `setAliases` mempty
-typeOf (Reshape shape  e _) =
-  typeOf e `setArrayShape` Rank n
-  where n = case typeOf shape of Record ts -> length ts
-                                 _         -> 1
-typeOf (Rearrange _ e _) = typeOf e
-typeOf (Transpose e _) = typeOf e
-typeOf (Rotate _ _ e _) = typeOf e
-typeOf (Map f _ _) = arrayType 1 et Unique `setAliases` S.empty
-  where et = lambdaReturnType f
-typeOf (Reduce _ fun _ _ _) =
-  lambdaReturnType fun `setAliases` mempty
-typeOf (Zip i e es _) =
-  Array $ RecordArray (M.fromList $ zip tupleFieldNames $
-                       zipWith typeToRecordArrayElem es_ts es_us) (Rank (1+i)) u
-  where ts' = map typeOf $ e:es
-        es_ts = map (stripArray (1+i)) ts'
-        es_us = map uniqueness ts'
-        u     = mconcat es_us
-typeOf (Unzip _ ts _) =
-  tupleRecord $ map unInfo ts
-typeOf (Unsafe e _) =
-  typeOf e
-typeOf (Scan fun _ _ _) =
-  arrayType 1 et Unique
-  where et = lambdaReturnType fun `setAliases` mempty
-typeOf (Filter _ arr _) =
-  typeOf arr
-typeOf (Partition funs arr _) =
-  tupleRecord $ replicate (length funs + 1) $ typeOf arr
-typeOf (Stream form lam _ _) =
-  case form of
-    MapLike{}    -> lambdaReturnType lam
-                    `setAliases` S.empty
-                    `setUniqueness` Unique
-    RedLike{}    -> lambdaReturnType lam
-                    `setAliases` S.empty
-                    `setUniqueness` Unique
-    Sequential{} -> lambdaReturnType lam
-                    `setAliases` S.empty
-                    `setUniqueness` Unique
-typeOf (Concat _ x _ _) =
-  typeOf x `setUniqueness` Unique `setAliases` S.empty
-typeOf (Split _ splitexps e _) =
-  tupleRecord $ replicate (1 + n) (typeOf e)
-  where n = case typeOf splitexps of Record ts -> length ts
-                                     _         -> 1
-typeOf (Copy e _) = typeOf e `setUniqueness` Unique `setAliases` S.empty
-typeOf (DoLoop _ _ _ _ body _) = typeOf body
-typeOf (Scatter a _i _v _) = typeOf a `setAliases` S.empty
+typeOf (LetWith _ _ _ _ _ (Info t) _) = t
+typeOf (Index _ _ (Info t) _) = t
+typeOf (Update e _ _ _) = typeOf e `setAliases` mempty
+typeOf (RecordUpdate _ _ _ (Info t) _) = t
+typeOf (Unsafe e _) = typeOf e
+typeOf (Assert _ e _ _) = typeOf e
+typeOf (DoLoop pat _ _ _ _) = patternType pat
+typeOf (Lambda params _ _ (Info (als, t)) _) =
+  unscopeType bound_here $
+  foldr (uncurry (Arrow ()) . patternParam) t params `setAliases` als
+  where bound_here = S.map identName (mconcat $ map patternIdents params)
+typeOf (OpSection _ (Info t) _) =
+  t
+typeOf (OpSectionLeft _ _ _ (_, Info pt2) (Info ret) _)  =
+  foldFunType [fromStruct pt2] ret
+typeOf (OpSectionRight _ _ _ (Info pt1, _) (Info ret) _) =
+  foldFunType [fromStruct pt1] ret
+typeOf (ProjectSection _ (Info t) _) = t
+typeOf (IndexSection _ (Info t) _) = t
+typeOf (VConstr0 _ (Info t) _)  = t
+typeOf (Match _ _ (Info t) _) = t
 
--- | The result of applying the arguments of the given types to a
--- function with the given return type, consuming its parameters with
--- the given diets.
-returnType :: (Ord vn, Hashable vn) =>
-              TypeBase shape ()
-           -> [Diet]
-           -> [CompTypeBase vn]
-           -> TypeBase shape (Names vn)
-returnType (Array at) ds args =
-  Array $ arrayReturnType at ds args
-returnType (Record fs) ds args =
-  Record $ fmap (\et -> returnType et ds args) fs
-returnType (Prim t) _ _ = Prim t
-returnType (TypeVar t) _ _ = TypeVar t
+foldFunType :: Monoid as => [TypeBase dim as] -> TypeBase dim as -> TypeBase dim as
+foldFunType ps ret = foldr (Arrow mempty Nothing) ret ps
 
-arrayReturnType :: (Ord vn, Hashable vn) =>
-                   ArrayTypeBase shape ()
-                -> [Diet]
-                -> [CompTypeBase vn]
-                -> ArrayTypeBase shape (Names vn)
-arrayReturnType (PrimArray bt sz Nonunique ()) ds args =
-  PrimArray bt sz Nonunique als
-  where als = mconcat $ map aliases $ zipWith maskAliases args ds
-arrayReturnType (PolyArray bt sz Nonunique ()) ds args =
-  PolyArray bt sz Nonunique als
-  where als = mconcat $ map aliases $ zipWith maskAliases args ds
-arrayReturnType (RecordArray et sz Nonunique) ds args =
-  RecordArray (fmap (\t -> recordArrayElemReturnType t ds args) et) sz Nonunique
-arrayReturnType (PrimArray et sz Unique ()) _ _ =
-  PrimArray et sz Unique mempty
-arrayReturnType (PolyArray et sz Unique ()) _ _ =
-  PolyArray et sz Unique mempty
-arrayReturnType (RecordArray et sz Unique) _ _ =
-  RecordArray (fmap (`addRecordArrayElemAliases` const mempty) et) sz Unique
+-- | Extract the parameter types and return type from a type.
+-- If the type is not an arrow type, the list of parameter types is empty.
+unfoldFunType :: TypeBase dim as -> ([TypeBase dim as], TypeBase dim as)
+unfoldFunType (Arrow _ _ t1 t2) = let (ps, r) = unfoldFunType t2
+                                  in (t1 : ps, r)
+unfoldFunType t = ([], t)
 
-recordArrayElemReturnType :: (Ord vn, Hashable vn) =>
-                            RecordArrayElemTypeBase shape ()
-                         -> [Diet]
-                         -> [CompTypeBase vn]
-                         -> RecordArrayElemTypeBase shape (Names vn)
-recordArrayElemReturnType (PrimArrayElem bt () u) ds args =
-  PrimArrayElem bt als u
-  where als = mconcat $ map aliases $ zipWith maskAliases args ds
-recordArrayElemReturnType (PolyArrayElem bt () u) ds args =
-  PolyArrayElem bt als u
-  where als = mconcat $ map aliases $ zipWith maskAliases args ds
-recordArrayElemReturnType (ArrayArrayElem at) ds args =
-  ArrayArrayElem $ arrayReturnType at ds args
-recordArrayElemReturnType (RecordArrayElem ts) ds args =
-  RecordArrayElem $ fmap (\t -> recordArrayElemReturnType t ds args) ts
+-- | The type names mentioned in a type.
+typeVars :: Monoid as => TypeBase dim as -> S.Set VName
+typeVars t =
+  case t of
+    Prim{} -> mempty
+    TypeVar _ _ tn targs ->
+      mconcat $ typeVarFree tn : map typeArgFree targs
+    Arrow _ _ t1 t2 -> typeVars t1 <> typeVars t2
+    Record fields -> foldMap typeVars fields
+    Array _ _ ArrayPrimElem{} _ -> mempty
+    Array _ _ (ArrayPolyElem tn targs) _ ->
+      mconcat $ typeVarFree tn : map typeArgFree targs
+    Array _ _ (ArrayRecordElem fields) _ ->
+      foldMap (typeVars . f) fields
+      -- This local function is to avoid an ambiguous type.
+      where f :: RecordArrayElemTypeBase dim -> TypeBase dim ()
+            f = recordArrayElemToType
+    Array _ _ ArrayEnumElem{} _ -> mempty
+    Enum{} -> mempty
+  where typeVarFree = S.singleton . typeLeaf
+        typeArgFree (TypeArgType ta _) = typeVars ta
+        typeArgFree TypeArgDim{} = mempty
 
--- | The specified return type of a lambda.
-lambdaReturnType :: Ord vn =>
-                    LambdaBase Info vn -> TypeBase Rank ()
-lambdaReturnType (AnonymFun _ _ _ (Info t) _)       = removeShapeAnnotations t
-lambdaReturnType (CurryFun _ _ (Info (_, t)) _)     = toStruct t
-lambdaReturnType (BinOpFun _ _ _ (Info t) _)        = toStruct t
-lambdaReturnType (CurryBinOpLeft _ _ _ (Info t) _)  = toStruct t
-lambdaReturnType (CurryBinOpRight _ _ _ (Info t) _) = toStruct t
+-- | @orderZero t@ is 'True' if the argument type has order 0, i.e., it is not
+-- a function type, does not contain a function type as a subcomponent, and may
+-- not be instantiated with a function type.
+orderZero :: TypeBase dim as -> Bool
+orderZero (Prim _)        = True
+orderZero Array{}         = True
+orderZero (Record fs)     = all orderZero $ M.elems fs
+orderZero TypeVar{}       = True
+orderZero Arrow{}         = False
+orderZero Enum{}          = True
 
--- | Is the type concrete, i.e, without any type variables?
-concreteType :: TypeBase f vn -> Bool
-concreteType Prim{} = True
-concreteType TypeVar{} = False
-concreteType (Record ts) = all concreteType ts
-concreteType (Array at) = concreteArrayType at
-  where concreteArrayType PrimArray{}          = True
-        concreteArrayType PolyArray{}          = False
-        concreteArrayType (RecordArray ts _ _) = all concreteRecordArrayElem ts
+-- | Extract all the shape names that occur in a given pattern.
+patternDimNames :: PatternBase Info VName -> S.Set VName
+patternDimNames (TuplePattern ps _)    = foldMap patternDimNames ps
+patternDimNames (RecordPattern fs _)   = foldMap (patternDimNames . snd) fs
+patternDimNames (PatternParens p _)    = patternDimNames p
+patternDimNames (Id _ (Info tp) _)     = typeDimNames tp
+patternDimNames (Wildcard (Info tp) _) = typeDimNames tp
+patternDimNames (PatternAscription p (TypeDecl _ (Info t)) _) =
+  patternDimNames p <> typeDimNames t
+patternDimNames (PatternLit _ (Info tp) _) = typeDimNames tp
 
-        concreteRecordArrayElem PrimArrayElem{} = True
-        concreteRecordArrayElem (ArrayArrayElem at') = concreteArrayType at'
-        concreteRecordArrayElem PolyArrayElem{} = False
-        concreteRecordArrayElem (RecordArrayElem fs) = all concreteRecordArrayElem fs
+-- | Extract all the shape names that occur in a given type.
+typeDimNames :: TypeBase (DimDecl VName) als -> S.Set VName
+typeDimNames = foldMap dimName . nestedDims
+  where dimName :: DimDecl VName -> S.Set VName
+        dimName (NamedDim qn) = S.singleton $ qualLeaf qn
+        dimName _             = mempty
 
--- | The set of names bound in a pattern, including dimension declarations.
-patNameSet :: (Ord vn, Hashable vn) => PatternBase NoInfo vn -> S.Set vn
-patNameSet =  S.fromList . map identName . patIdentsGen sizeIdent
-  where sizeIdent name = Ident name NoInfo
+-- | @patternOrderZero pat@ is 'True' if all of the types in the given pattern
+-- have order 0.
+patternOrderZero :: PatternBase Info vn -> Bool
+patternOrderZero pat = case pat of
+  TuplePattern ps _       -> all patternOrderZero ps
+  RecordPattern fs _      -> all (patternOrderZero . snd) fs
+  PatternParens p _       -> patternOrderZero p
+  Id _ (Info t) _         -> orderZero t
+  Wildcard (Info t) _     -> orderZero t
+  PatternAscription p _ _ -> patternOrderZero p
+  PatternLit _ (Info t) _ -> orderZero t
 
--- | The set of identifiers bound in a pattern, including dimension declarations.
-patIdentSet :: (Ord vn, Hashable vn) => PatternBase Info vn -> S.Set (IdentBase Info vn)
-patIdentSet = S.fromList . patIdentsGen sizeIdent
-  where sizeIdent name = Ident name (Info $ Prim $ Signed Int32)
-
-patIdentsGen :: (Ord vn, Hashable vn) =>
-                (vn -> SrcLoc -> IdentBase f vn) -> PatternBase f vn
-             -> [IdentBase f vn]
-patIdentsGen _ (Id ident)              = [ident]
-patIdentsGen f (PatternParens p _)     = patIdentsGen f p
-patIdentsGen f (TuplePattern pats _)   = mconcat $ map (patIdentsGen f) pats
-patIdentsGen f (RecordPattern fs _)    = mconcat $ map (patIdentsGen f . snd) fs
-patIdentsGen _ Wildcard{}              = []
-patIdentsGen f (PatternAscription p t) =
-  patIdentsGen f p <> mapMaybe (dimIdent (srclocOf p)) (nestedDims' (declaredType t))
-  where dimIdent _ (ConstDim _)      = Nothing
-        dimIdent _ (NamedDim _)      = Nothing
-        dimIdent loc (BoundDim name) = Just $ f name loc
+-- | The set of identifiers bound in a pattern.
+patternIdents :: (Functor f, Ord vn) => PatternBase f vn -> S.Set (IdentBase f vn)
+patternIdents (Id v t loc)              = S.singleton $ Ident v t loc
+patternIdents (PatternParens p _)       = patternIdents p
+patternIdents (TuplePattern pats _)     = mconcat $ map patternIdents pats
+patternIdents (RecordPattern fs _)      = mconcat $ map (patternIdents . snd) fs
+patternIdents Wildcard{}                = mempty
+patternIdents (PatternAscription p _ _) = patternIdents p
+patternIdents PatternLit{}              = mempty
 
 -- | The type of values bound by the pattern.
-patternType :: PatternBase Info VName -> CompTypeBase VName
-patternType (Wildcard (Info t) _)   = t
-patternType (PatternParens p _)     = patternType p
-patternType (Id ident)              = unInfo $ identType ident
-patternType (TuplePattern pats _)   = tupleRecord $ map patternType pats
-patternType (RecordPattern fs _)    = Record $ patternType <$> M.fromList fs
-patternType (PatternAscription p _) = patternType p
+patternType :: PatternBase Info VName -> PatternType
+patternType (Wildcard (Info t) _)     = t
+patternType (PatternParens p _)       = patternType p
+patternType (Id _ (Info t) _)         = t
+patternType (TuplePattern pats _)     = tupleRecord $ map patternType pats
+patternType (RecordPattern fs _)      = Record $ patternType <$> M.fromList fs
+patternType (PatternAscription p _ _) = patternType p
+patternType (PatternLit _ (Info t) _) = t
+
+-- | The type of a pattern, including shape annotations.
+patternPatternType :: PatternBase Info VName -> PatternType
+patternPatternType (Wildcard (Info t) _)      = t
+patternPatternType (PatternParens p _)        = patternPatternType p
+patternPatternType (Id _ (Info t) _)          = t
+patternPatternType (TuplePattern pats _)      = tupleRecord $ map patternPatternType pats
+patternPatternType (RecordPattern fs _)       = Record $ patternPatternType <$> M.fromList fs
+patternPatternType (PatternAscription p _ _)  = patternPatternType p
+patternPatternType (PatternLit _ (Info t) _)  = t
 
 -- | The type matched by the pattern, including shape declarations if present.
-patternStructType :: PatternBase Info VName -> StructTypeBase VName
-patternStructType (PatternAscription _ td) = unInfo $ expandedType td
-patternStructType (PatternParens p _) = patternStructType p
-patternStructType (Id v) = vacuousShapeAnnotations $ toStruct $ unInfo $ identType v
-patternStructType (TuplePattern ps _) = tupleRecord $ map patternStructType ps
-patternStructType (RecordPattern fs _) = Record $ patternStructType <$> M.fromList fs
-patternStructType (Wildcard (Info t) _) = vacuousShapeAnnotations $ toStruct t
+patternStructType :: PatternBase Info VName -> StructType
+patternStructType = toStruct . patternPatternType
+
+-- | When viewed as a function parameter, does this pattern correspond
+-- to a named parameter of some type?
+patternParam :: PatternBase Info VName -> (Maybe VName, StructType)
+patternParam (PatternParens p _) =
+  patternParam p
+patternParam (PatternAscription (Id v _ _) td _) =
+  (Just v, unInfo $ expandedType td)
+patternParam (Id v (Info t) _) =
+  (Just v, toStruct t)
+patternParam p =
+  (Nothing, patternStructType p)
 
 -- | Names of primitive types to types.  This is only valid if no
 -- shadowing is going on, but useful for tools.
@@ -808,59 +616,42 @@ namesToPrimTypes = M.fromList
                           map Unsigned [minBound..maxBound] ++
                           map FloatType [minBound..maxBound] ]
 
--- | The nature of something predefined.  These can either be monomorphic
--- or polymorphic.  A polymorphic builtin is a mapping from valid
--- parameter types to the result type.
+-- | The nature of something predefined.  These can either be
+-- monomorphic or overloaded.  An overloaded builtin is a list valid
+-- types it can be instantiated with, to the parameter and result
+-- type, with 'Nothing' representing the overloaded parameter type.
 data Intrinsic = IntrinsicMonoFun [PrimType] PrimType
-               | IntrinsicPolyFun [([PrimType], PrimType)]
+               | IntrinsicOverloadedFun [PrimType] [Maybe PrimType] (Maybe PrimType)
+               | IntrinsicPolyFun [TypeParamBase VName] [TypeBase () ()] (TypeBase () ())
                | IntrinsicType PrimType
                | IntrinsicEquality -- Special cased.
                | IntrinsicOpaque
 
 -- | A map of all built-ins.
 intrinsics :: M.Map VName Intrinsic
-intrinsics = M.fromList $ zipWith namify [0..] $
-             map (second $ uncurry IntrinsicMonoFun)
-             [("sqrt32", ([FloatType Float32], FloatType Float32))
-             ,("log32", ([FloatType Float32], FloatType Float32))
-             ,("exp32", ([FloatType Float32], FloatType Float32))
-             ,("cos32", ([FloatType Float32], FloatType Float32))
-             ,("sin32", ([FloatType Float32], FloatType Float32))
-             ,("acos32", ([FloatType Float32], FloatType Float32))
-             ,("asin32", ([FloatType Float32], FloatType Float32))
-             ,("atan32", ([FloatType Float32], FloatType Float32))
-             ,("atan2_32", ([FloatType Float32, FloatType Float32], FloatType Float32))
-             ,("isinf32", ([FloatType Float32], Bool))
-             ,("isnan32", ([FloatType Float32], Bool))
+intrinsics = M.fromList $ zipWith namify [10..] $
 
-             ,("sqrt64", ([FloatType Float64], FloatType Float64))
-             ,("log64", ([FloatType Float64], FloatType Float64))
-             ,("exp64", ([FloatType Float64], FloatType Float64))
-             ,("cos64", ([FloatType Float64], FloatType Float64))
-             ,("sin64", ([FloatType Float64], FloatType Float64))
-             ,("acos64", ([FloatType Float64], FloatType Float64))
-             ,("asin64", ([FloatType Float64], FloatType Float64))
-             ,("atan64", ([FloatType Float64], FloatType Float64))
-             ,("atan2_64", ([FloatType Float64, FloatType Float64], FloatType Float64))
-             ,("isinf64", ([FloatType Float64], Bool))
-             ,("isnan64", ([FloatType Float64], Bool))
+             map primFun (M.toList Primitive.primFuns) ++
 
-             ] ++
-
-             [ ("~", IntrinsicPolyFun $
-                     [([Signed t], Signed t) | t <- [minBound..maxBound] ] ++
-                     [([Unsigned t], Unsigned t) | t <- [minBound..maxBound] ])
+             [ ("~", IntrinsicOverloadedFun
+                     (map Signed [minBound..maxBound] ++
+                      map Unsigned [minBound..maxBound])
+                     [Nothing] Nothing)
              , ("!", IntrinsicMonoFun [Bool] Bool)] ++
 
              [("opaque", IntrinsicOpaque)] ++
-
-             map (convertFun anyPrimType) anyPrimType ++
 
              map unOpFun Primitive.allUnOps ++
 
              map binOpFun Primitive.allBinOps ++
 
              map cmpOpFun Primitive.allCmpOps ++
+
+             map convOpFun Primitive.allConvOps ++
+
+             map signFun Primitive.allIntTypes ++
+
+             map unsignFun Primitive.allIntTypes ++
 
              map intrinsicType (map Signed [minBound..maxBound] ++
                                 map Unsigned [minBound..maxBound] ++
@@ -869,12 +660,104 @@ intrinsics = M.fromList $ zipWith namify [0..] $
 
              -- The reason for the loop formulation is to ensure that we
              -- get a missing case warning if we forget a case.
-             map mkIntrinsicBinOp [minBound..maxBound]
+             mapMaybe mkIntrinsicBinOp [minBound..maxBound] ++
 
-  where namify i (k,v) = (VName (nameFromString k) i, v)
+             [("flatten", IntrinsicPolyFun [tp_a]
+                          [Array () Nonunique (ArrayPolyElem tv_a' []) (rank 2)] $
+                          Array () Nonunique (ArrayPolyElem tv_a' []) (rank 1)),
+              ("unflatten", IntrinsicPolyFun [tp_a]
+                            [Prim $ Signed Int32,
+                             Prim $ Signed Int32,
+                             Array () Nonunique (ArrayPolyElem tv_a' []) (rank 1)] $
+                            Array () Nonunique (ArrayPolyElem tv_a' []) (rank 2)),
 
-        convertFun :: [PrimType] -> PrimType -> (String,Intrinsic)
-        convertFun from to = (pretty to, IntrinsicPolyFun $ zip (map pure from) (repeat to))
+              ("concat", IntrinsicPolyFun [tp_a]
+                         [arr_a, arr_a] uarr_a),
+              ("rotate", IntrinsicPolyFun [tp_a]
+                         [Prim $ Signed Int32, arr_a] arr_a),
+              ("transpose", IntrinsicPolyFun [tp_a] [arr_2d_a] arr_2d_a),
+
+              ("cmp_threshold", IntrinsicPolyFun []
+                                [Prim $ Signed Int32,
+                                 Array () Nonunique (ArrayPrimElem (Signed Int32)) (rank 1)] $
+                                Prim Bool),
+
+               ("scatter", IntrinsicPolyFun [tp_a]
+                          [Array () Unique (ArrayPolyElem tv_a' []) (rank 1),
+                           Array () Nonunique (ArrayPrimElem (Signed Int32)) (rank 1),
+                           Array () Nonunique (ArrayPolyElem tv_a' []) (rank 1)] $
+                          Array () Unique (ArrayPolyElem tv_a' []) (rank 1)),
+
+              ("zip", IntrinsicPolyFun [tp_a, tp_b] [arr_a, arr_b] arr_a_b),
+              ("unzip", IntrinsicPolyFun [tp_a, tp_b] [arr_a_b] t_arr_a_arr_b),
+
+              ("gen_reduce", IntrinsicPolyFun [tp_a]
+                             [uarr_a,
+                              t_a `arr` (t_a `arr` t_a),
+                              t_a,
+                              Array () Nonunique (ArrayPrimElem (Signed Int32)) (rank 1),
+                              arr_a]
+                             uarr_a),
+
+              ("map", IntrinsicPolyFun [tp_a, tp_b] [t_a `arr` t_b, arr_a] uarr_b),
+
+              ("reduce", IntrinsicPolyFun [tp_a]
+                         [t_a `arr` (t_a `arr` t_a), t_a, arr_a] t_a),
+
+              ("reduce_comm", IntrinsicPolyFun [tp_a]
+                              [t_a `arr` (t_a `arr` t_a), t_a, arr_a] t_a),
+
+              ("scan", IntrinsicPolyFun [tp_a]
+                       [t_a `arr` (t_a `arr` t_a), t_a, arr_a] uarr_a),
+
+              ("partition",
+               IntrinsicPolyFun [tp_a]
+               [Prim (Signed Int32), t_a `arr` Prim (Signed Int32), arr_a] $
+               tupleRecord [uarr_a, Array () Unique (ArrayPrimElem (Signed Int32)) (rank 1)]),
+
+              ("stream_map",
+               IntrinsicPolyFun [tp_a, tp_b] [Prim (Signed Int32) `arr` (arr_a `arr` arr_b), arr_a] uarr_b),
+
+              ("stream_map_per",
+               IntrinsicPolyFun [tp_a, tp_b] [Prim (Signed Int32) `arr` (arr_a `arr` arr_b), arr_a] uarr_b),
+
+              ("stream_red",
+               IntrinsicPolyFun [tp_a, tp_b] [t_b `arr` (t_b `arr` t_b), Prim (Signed Int32) `arr` (arr_a `arr` t_b), arr_a] t_b),
+
+              ("stream_red_per",
+               IntrinsicPolyFun [tp_a, tp_b] [t_b `arr` (t_b `arr` t_b), Prim (Signed Int32) `arr` (arr_a `arr` t_b), arr_a] t_b),
+
+              ("trace", IntrinsicPolyFun [tp_a] [t_a] t_a),
+              ("break", IntrinsicPolyFun [tp_a] [t_a] t_a)]
+
+  where tv_a = VName (nameFromString "a") 0
+        tv_a' = typeName tv_a
+        t_a = TypeVar () Nonunique tv_a' []
+        arr_a = Array () Nonunique (ArrayPolyElem tv_a' []) (rank 1)
+        arr_2d_a = Array () Nonunique (ArrayPolyElem tv_a' []) (rank 2)
+        uarr_a = Array () Unique (ArrayPolyElem tv_a' []) (rank 1)
+        tp_a = TypeParamType Unlifted tv_a noLoc
+
+        tv_b = VName (nameFromString "b") 1
+        tv_b' = typeName tv_b
+        t_b = TypeVar () Nonunique tv_b' []
+        arr_b = Array () Nonunique (ArrayPolyElem tv_b' []) (rank 1)
+        uarr_b = Array () Unique (ArrayPolyElem tv_b' []) (rank 1)
+        tp_b = TypeParamType Unlifted tv_b noLoc
+
+        arr_a_b = Array () Nonunique
+                  (ArrayRecordElem (M.fromList $ zip tupleFieldNames
+                                     [RecordArrayElem $ ArrayPolyElem tv_a' [],
+                                      RecordArrayElem $ ArrayPolyElem tv_b' []]))
+                  (rank 1)
+        t_arr_a_arr_b = Record $ M.fromList $ zip tupleFieldNames [arr_a, arr_b]
+
+        arr = Arrow mempty Nothing
+
+        namify i (k,v) = (VName (nameFromString k) i, v)
+
+        primFun (name, (ts,t, _)) =
+          (name, IntrinsicMonoFun (map unPrim ts) $ unPrim t)
 
         unOpFun bop = (pretty bop, IntrinsicMonoFun [t] t)
           where t = unPrim $ Primitive.unOpType bop
@@ -884,6 +767,13 @@ intrinsics = M.fromList $ zipWith namify [0..] $
 
         cmpOpFun bop = (pretty bop, IntrinsicMonoFun [t, t] Bool)
           where t = unPrim $ Primitive.cmpOpType bop
+
+        convOpFun cop = (pretty cop, IntrinsicMonoFun [unPrim ft] $ unPrim tt)
+          where (ft, tt) = Primitive.convOpType cop
+
+        signFun t = ("sign_" ++ pretty t, IntrinsicMonoFun [Unsigned t] $ Signed t)
+
+        unsignFun t = ("unsign_" ++ pretty t, IntrinsicMonoFun [Signed t] $ Unsigned t)
 
         unPrim (Primitive.IntType t) = Signed t
         unPrim (Primitive.FloatType t) = FloatType t
@@ -898,11 +788,12 @@ intrinsics = M.fromList $ zipWith namify [0..] $
                         map FloatType [minBound..maxBound]
         anyPrimType = Bool : anyNumberType
 
-        mkIntrinsicBinOp :: BinOp -> (String, Intrinsic)
-        mkIntrinsicBinOp op = (pretty op, intrinsicBinOp op)
+        mkIntrinsicBinOp :: BinOp -> Maybe (String, Intrinsic)
+        mkIntrinsicBinOp op = do op' <- intrinsicBinOp op
+                                 return (pretty op, op')
 
-        binOp :: [PrimType] -> Intrinsic
-        binOp ts = IntrinsicPolyFun [ ([t,t], t) | t <- ts ]
+        binOp ts = Just $ IntrinsicOverloadedFun ts [Nothing, Nothing] Nothing
+        ordering = Just $ IntrinsicOverloadedFun anyPrimType [Nothing, Nothing] (Just Bool)
 
         intrinsicBinOp Plus     = binOp anyNumberType
         intrinsicBinOp Minus    = binOp anyNumberType
@@ -913,21 +804,19 @@ intrinsics = M.fromList $ zipWith namify [0..] $
         intrinsicBinOp Quot     = binOp anyIntType
         intrinsicBinOp Rem      = binOp anyIntType
         intrinsicBinOp ShiftR   = binOp anyIntType
-        intrinsicBinOp ZShiftR  = binOp anyIntType
         intrinsicBinOp ShiftL   = binOp anyIntType
         intrinsicBinOp Band     = binOp anyIntType
         intrinsicBinOp Xor      = binOp anyIntType
         intrinsicBinOp Bor      = binOp anyIntType
-        intrinsicBinOp LogAnd   = IntrinsicMonoFun [Bool,Bool] Bool
-        intrinsicBinOp LogOr    = IntrinsicMonoFun [Bool,Bool] Bool
-        intrinsicBinOp Equal    = IntrinsicEquality
-        intrinsicBinOp NotEqual = IntrinsicEquality
+        intrinsicBinOp LogAnd   = Just $ IntrinsicMonoFun [Bool,Bool] Bool
+        intrinsicBinOp LogOr    = Just $ IntrinsicMonoFun [Bool,Bool] Bool
+        intrinsicBinOp Equal    = Just IntrinsicEquality
+        intrinsicBinOp NotEqual = Just IntrinsicEquality
         intrinsicBinOp Less     = ordering
         intrinsicBinOp Leq      = ordering
         intrinsicBinOp Greater  = ordering
         intrinsicBinOp Geq      = ordering
-
-        ordering = IntrinsicPolyFun [ ([t,t], Bool) | t <- anyPrimType ]
+        intrinsicBinOp _        = Nothing
 
 -- | The largest tag used by an intrinsic - this can be used to
 -- determine whether a 'VName' refers to an intrinsic or a user-defined name.
@@ -939,36 +828,96 @@ qualName :: v -> QualName v
 qualName = QualName []
 
 -- | Add another qualifier (at the head) to a qualified name.
-qualify :: Name -> QualName v -> QualName v
+qualify :: v -> QualName v -> QualName v
 qualify k (QualName ks v) = QualName (k:ks) v
 
 -- | Create a type name name with no qualifiers from a 'VName'.
 typeName :: VName -> TypeName
 typeName = typeNameFromQualName . qualName
 
-progImports :: ProgBase f vn -> [String]
-progImports (Prog decs) = concatMap decImports decs
-  where decImports (OpenDec x xs _) =
-          concatMap modExpImports $ x:xs
-        decImports (ModDec md) =
-          modExpImports $ modExp md
-        decImports SigDec{} = []
-        decImports TypeDec{} = []
-        decImports ValDec{} = []
-        decImports FunDec{} = []
+-- | The modules imported by a Futhark program.
+progImports :: ProgBase f vn -> [(String,SrcLoc)]
+progImports = concatMap decImports . progDecs
 
-        modExpImports ModVar{}              = []
-        modExpImports (ModParens p _)       = modExpImports p
-        modExpImports (ModImport f _)       = [f]
-        modExpImports (ModDecs ds _)        = concatMap decImports ds
-        modExpImports (ModApply _ me _ _ _) = modExpImports me
-        modExpImports (ModAscript me _ _ _) = modExpImports me
-        modExpImports ModLambda{}           = []
+-- | The modules imported by a single declaration.
+decImports :: DecBase f vn -> [(String,SrcLoc)]
+decImports (OpenDec x _) = modExpImports x
+decImports (ModDec md) = modExpImports $ modExp md
+decImports SigDec{} = []
+decImports TypeDec{} = []
+decImports ValDec{} = []
+decImports (LocalDec d _) = decImports d
+decImports (ImportDec x _ loc) = [(x, loc)]
+
+modExpImports :: ModExpBase f vn -> [(String,SrcLoc)]
+modExpImports ModVar{}              = []
+modExpImports (ModParens p _)       = modExpImports p
+modExpImports (ModImport f _ loc)   = [(f,loc)]
+modExpImports (ModDecs ds _)        = concatMap decImports ds
+modExpImports (ModApply _ me _ _ _) = modExpImports me
+modExpImports (ModAscript me _ _ _) = modExpImports me
+modExpImports ModLambda{}           = []
+
+-- | The set of module types used in any exported (non-local)
+-- declaration.
+progModuleTypes :: Ord vn => ProgBase f vn -> S.Set vn
+progModuleTypes = mconcat . map onDec . progDecs
+  where onDec (OpenDec x _) = onModExp x
+        onDec (ModDec md) =
+          maybe mempty (onSigExp . fst) (modSignature md) <> onModExp (modExp md)
+        onDec SigDec{} = mempty
+        onDec TypeDec{} = mempty
+        onDec ValDec{} = mempty
+        onDec LocalDec{} = mempty
+        onDec ImportDec{} = mempty
+
+        onModExp ModVar{} = mempty
+        onModExp (ModParens p _) = onModExp p
+        onModExp ModImport {} = mempty
+        onModExp (ModDecs ds _) = mconcat $ map onDec ds
+        onModExp (ModApply me1 me2 _ _ _) = onModExp me1 <> onModExp me2
+        onModExp (ModAscript me se _ _) = onModExp me <> onSigExp se
+        onModExp (ModLambda p r me _) =
+          onModParam p <> maybe mempty (onSigExp . fst) r <> onModExp me
+
+        onModParam = onSigExp . modParamType
+
+        onSigExp (SigVar v _) = S.singleton $ qualLeaf v
+        onSigExp (SigParens e _) = onSigExp e
+        onSigExp SigSpecs{} = mempty
+        onSigExp (SigWith e _ _) = onSigExp e
+        onSigExp (SigArrow _ e1 e2 _) = onSigExp e1 <> onSigExp e2
+
+-- | Extract a leading @((name, namespace, file), remainder)@ from a
+-- documentation comment string.  These are formatted as
+-- \`name\`\@namespace[\@file].  Let us hope that this pattern does not occur
+-- anywhere else.
+identifierReference :: String -> Maybe ((String, String, Maybe FilePath), String)
+identifierReference ('`' : s)
+  | (identifier, '`' : '@' : s') <- break (=='`') s,
+    (namespace, s'') <- span isAlpha s',
+    not $ null namespace =
+      case s'' of
+        '@' : '"' : s'''
+          | (file, '"' : s'''') <- span (/= '"') s''' ->
+            Just ((identifier, namespace, Just file), s'''')
+        _ -> Just ((identifier, namespace, Nothing), s'')
+
+identifierReference _ = Nothing
+
+-- | Find all the identifier references in a string.
+identifierReferences :: String -> [(String, String, Maybe FilePath)]
+identifierReferences [] = []
+identifierReferences s
+  | Just (ref, s') <- identifierReference s =
+      ref : identifierReferences s'
+identifierReferences (_:s') =
+  identifierReferences s'
 
 -- | Given an operator name, return the operator that determines its
 -- syntactical properties.
 leadingOperator :: Name -> BinOp
-leadingOperator s = maybe LogAnd snd $ find ((`isPrefixOf` s') . fst) $
+leadingOperator s = maybe Backtick snd $ find ((`isPrefixOf` s') . fst) $
                     sortBy (flip $ comparing $ length . fst) $
                     zip (map pretty operators) operators
   where s' = nameToString s
@@ -980,8 +929,8 @@ type UncheckedType = TypeBase (ShapeDecl Name) ()
 
 type UncheckedTypeExp = TypeExp Name
 
--- | An array type with no aliasing information.
-type UncheckedArrayType = ArrayTypeBase (ShapeDecl Name) ()
+-- | An array element type with no aliasing information.
+type UncheckedArrayElemType = ArrayElemTypeBase (ShapeDecl Name)
 
 -- | A type declaration with no expanded type.
 type UncheckedTypeDecl = TypeDeclBase NoInfo Name
@@ -1001,17 +950,20 @@ type UncheckedModExp = ModExpBase NoInfo Name
 -- | A module type expression with no type annotations.
 type UncheckedSigExp = SigExpBase NoInfo Name
 
--- | A lambda with no type annotations.
-type UncheckedLambda = LambdaBase NoInfo Name
+-- | A type parameter with no type annotations.
+type UncheckedTypeParam = TypeParamBase Name
 
 -- | A pattern with no type annotations.
 type UncheckedPattern = PatternBase NoInfo Name
 
 -- | A function declaration with no type annotations.
-type UncheckedFunBind = FunBindBase NoInfo Name
+type UncheckedValBind = ValBindBase NoInfo Name
 
 -- | A declaration with no type annotations.
 type UncheckedDec = DecBase NoInfo Name
 
 -- | A Futhark program with no type annotations.
 type UncheckedProg = ProgBase NoInfo Name
+
+-- | A case (of a match expression) with no type annotations.
+type UncheckedCase = CaseBase NoInfo Name

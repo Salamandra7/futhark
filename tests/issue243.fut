@@ -20,17 +20,15 @@ let resi (x: i32) (y: i32): i32 =
 
 entry main (n: i32): []i32 =
   let (_, t_v1) = split 1 (iota (n+1)) in
-  let t_v7 = rearrange (1, 0) (replicate n t_v1) in
-  let t_v8 = reshape ((n, n)) (iota (n*n)) in
-  let t_v12 = let array = map (\(x: []i32) (y: []i32): [n]i32 ->
-                                   map resi (x) (y)) t_v7 t_v8 in
-              let n = (shape (array))[1] in
+  let t_v7 = transpose (replicate n t_v1) in
+  let t_v8 = unflatten n n (iota (n*n)) in
+  let t_v12 = let (array: [][n]i32) = map2 (\(x: []i32) (y: []i32): [n]i32 ->
+                                              map2 resi (x) (y)) t_v7 t_v8 in
               map (\(x: []i32): [n]bool ->
                    map (0==) x) (array) in
   let array =
     (map (\(x: []i32): i32 -> reduce (+) (0) (x))
-     (let array = rearrange (1, 0) (t_v12) in
-      let n = (shape (array))[1] in
+     (let (array: [][n]bool) = transpose (t_v12) in
       map (\(x: []bool): [n]i32 ->
              map boolToInt (x)) (array)))
   in array

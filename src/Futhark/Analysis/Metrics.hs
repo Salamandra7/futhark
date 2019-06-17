@@ -3,7 +3,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 -- | Abstract Syntax Tree metrics.  This is used in the @futhark-test@ program.
 module Futhark.Analysis.Metrics
-       ( AstMetrics
+       ( AstMetrics(..)
        , progMetrics
 
          -- * Extensibility
@@ -16,7 +16,6 @@ module Futhark.Analysis.Metrics
        , lambdaMetrics
        ) where
 
-import Control.Applicative
 import Control.Monad.Writer
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -24,11 +23,21 @@ import Data.String
 import Data.List
 import qualified Data.Map.Strict as M
 
-import Prelude
-
 import Futhark.Representation.AST
 
-type AstMetrics = M.Map Text Int
+newtype AstMetrics = AstMetrics (M.Map Text Int)
+
+instance Show AstMetrics where
+  show (AstMetrics m) = unlines $ map metric $ M.toList m
+    where metric (k, v) = pretty k ++ " " ++ pretty v
+
+instance Read AstMetrics where
+  readsPrec _ s =
+    maybe [] success $ mapM onLine $ lines s
+    where onLine l = case words l of
+                       [k, x] | [(n, "")] <- reads x -> Just (T.pack k, n)
+                       _ -> Nothing
+          success m = [(AstMetrics $ M.fromList m, "")]
 
 class OpMetrics op where
   opMetrics :: op -> MetricsM ()
@@ -38,14 +47,15 @@ instance OpMetrics () where
 
 newtype CountMetrics = CountMetrics [([Text], Text)]
 
+instance Semigroup CountMetrics where
+  CountMetrics x <> CountMetrics y = CountMetrics $ x <> y
+
 instance Monoid CountMetrics where
   mempty = CountMetrics mempty
 
-  mappend (CountMetrics x) (CountMetrics y) = CountMetrics $ x <> y
-
 actualMetrics :: CountMetrics -> AstMetrics
 actualMetrics (CountMetrics metrics) =
-  M.fromListWith (+) $ concatMap expand metrics
+  AstMetrics $ M.fromListWith (+) $ concatMap expand metrics
   where expand (ctx, k) =
           [ (T.intercalate "/" (ctx' ++ [k]), 1)
           | ctx' <- tails $ "" : ctx ]
@@ -72,7 +82,7 @@ bodyMetrics :: OpMetrics (Op lore) => Body lore -> MetricsM ()
 bodyMetrics = mapM_ bindingMetrics . bodyStms
 
 bindingMetrics :: OpMetrics (Op lore) => Stm lore -> MetricsM ()
-bindingMetrics = expMetrics . bindingExp
+bindingMetrics = expMetrics . stmExp
 
 expMetrics :: OpMetrics (Op lore) => Exp lore -> MetricsM ()
 expMetrics (BasicOp op) =
@@ -85,7 +95,7 @@ expMetrics (If _ tb fb _) =
   inside "If" $ do
     inside "True" $ bodyMetrics tb
     inside "False" $ bodyMetrics fb
-expMetrics (Apply fname _ _) =
+expMetrics (Apply fname _ _ _) =
   seen $ "Apply" <> fromString (nameToString fname)
 expMetrics (Op op) =
   opMetrics op
@@ -100,17 +110,17 @@ primOpMetrics ConvOp{} = seen "ConvOp"
 primOpMetrics CmpOp{} = seen "ConvOp"
 primOpMetrics Assert{} = seen "Assert"
 primOpMetrics Index{} = seen "Index"
-primOpMetrics Split{} = seen "Split"
+primOpMetrics Update{} = seen "Update"
 primOpMetrics Concat{} = seen "Concat"
 primOpMetrics Copy{} = seen "Copy"
 primOpMetrics Manifest{} = seen "Manifest"
 primOpMetrics Iota{} = seen "Iota"
 primOpMetrics Replicate{} = seen "Replicate"
+primOpMetrics Repeat{} = seen "Repeat"
 primOpMetrics Scratch{} = seen "Scratch"
 primOpMetrics Reshape{} = seen "Reshape"
 primOpMetrics Rearrange{} = seen "Rearrange"
 primOpMetrics Rotate{} = seen "Rotate"
-primOpMetrics Partition{} = seen "Partition"
 
 lambdaMetrics :: OpMetrics (Op lore) => Lambda lore -> MetricsM ()
 lambdaMetrics = bodyMetrics . lambdaBody

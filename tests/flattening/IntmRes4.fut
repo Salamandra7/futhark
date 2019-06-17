@@ -1,5 +1,4 @@
 -- ==
--- tags { no_opencl }
 -- input {
 --   [ [ [ [1,2,3], [4,5,6] ]
 --     ]
@@ -24,12 +23,12 @@
 --      [22, 20, 18]]]]
 -- }
 let addRows (xs: []i32, ys: []i32): []i32 =
-  map (+) xs ys
+  map2 (+) xs ys
 
-let main (xssss: [][][][]i32, cs: []i32, y: i32): [][][][]i32 =
+let main (xssss: [][][][]i32) (cs: []i32) (y: i32): [][][][]i32 =
   map  (\(xsss: [][][]i32, c: i32): [][][]i32  ->
          unsafe
-         let yss = reshape (2,c) xsss in
+         let yss = unflatten 2 c (flatten_3d xsss) in
          map  (\(xss: [][]i32): [][]i32  ->
                 map (\(xs: []i32, ys: []i32): []i32  ->
                       addRows(xs,ys)

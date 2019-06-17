@@ -12,6 +12,10 @@
 -- output { -1.0 }
 -- input { 0 1.79769e308 10.0 }
 -- output { 1.79769e308 }
+-- input { 0 0f64 f64.nan }
+-- output { f64.nan }
+-- input { 0 0f64 f64.inf }
+-- output { f64.inf }
 --
 -- input { 1 0.0 0.0 }
 -- output { 0.0 }
@@ -51,7 +55,7 @@
 -- input { 4 2.00 0.0 }
 -- output { 1.0 }
 
-let main(f: i32, x: f64, y: f64): f64 =
+let main (f: i32) (x: f64) (y: f64): f64 =
   if      f == 0 then x + y
   else if f == 1 then x - y
   else if f == 2 then x * y

@@ -26,7 +26,7 @@
 --      [19, 17, 15]]]]
 -- }
 let add1 (xs: []i32, ys: []i32): []i32 =
-  map (+) xs ys
+  map2 (+) xs ys
 
 let add2 (xs: [][]i32, ys: [][]i32): [][]i32 =
   map  add1 (zip  xs ys)
@@ -37,5 +37,5 @@ let add3 (xs: [][][]i32, ys: [][][]i32): [][][]i32 =
 let add4 (xs: [][][][]i32, ys: [][][][]i32): [][][][]i32 =
   map  add3 (zip  xs ys)
 
-let main(a: [][][][]i32, b: [][][][]i32): [][][][]i32 =
+let main (a: [][][][]i32) (b: [][][][]i32): [][][][]i32 =
   add4(a,b)

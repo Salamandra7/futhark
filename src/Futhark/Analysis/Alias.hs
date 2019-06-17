@@ -13,16 +13,11 @@ module Futhark.Analysis.Alias
        , analyseExp
        , analyseBody
        , analyseLambda
-       , analyseExtLambda
        )
        where
 
-import Data.Monoid
-
 import Futhark.Representation.AST.Syntax
 import Futhark.Representation.Aliases
-
-import Prelude
 
 -- | Perform alias analysis on a Futhark program.
 aliasAnalysis :: (Attributes lore, CanBeAliased (Op lore)) =>
@@ -39,28 +34,28 @@ analyseBody :: (Attributes lore,
                 CanBeAliased (Op lore)) =>
                Body lore -> Body (Aliases lore)
 analyseBody (Body lore origbnds result) =
-  let bnds' = map analyseStm origbnds
+  let bnds' = fmap analyseStm origbnds
   in mkAliasedBody lore bnds' result
 
 analyseStm :: (Attributes lore, CanBeAliased (Op lore)) =>
               Stm lore -> Stm (Aliases lore)
-analyseStm (Let pat lore e) =
+analyseStm (Let pat (StmAux cs attr) e) =
   let e' = analyseExp e
       pat' = addAliasesToPattern pat e'
-      lore' = (Names' $ consumedInPattern pat' <> consumedInExp e',
-               lore)
-  in Let pat' lore' e'
+      lore' = (Names' $ consumedInExp e', attr)
+  in Let pat' (StmAux cs lore') e'
 
 analyseExp :: (Attributes lore, CanBeAliased (Op lore)) =>
               Exp lore -> Exp (Aliases lore)
 analyseExp = mapExp analyse
   where analyse =
           Mapper { mapOnSubExp = return
-                 , mapOnCertificates = return
                  , mapOnVName = return
                  , mapOnBody = const $ return . analyseBody
                  , mapOnRetType = return
+                 , mapOnBranchType = return
                  , mapOnFParam = return
+                 , mapOnLParam = return
                  , mapOnOp = return . addOpAliases
                  }
 
@@ -70,11 +65,4 @@ analyseLambda lam =
   let body = analyseBody $ lambdaBody lam
   in lam { lambdaBody = body
          , lambdaParams = lambdaParams lam
-         }
-analyseExtLambda :: (Attributes lore, CanBeAliased (Op lore)) =>
-                    ExtLambda lore -> ExtLambda (Aliases lore)
-analyseExtLambda lam =
-  let body = analyseBody $ extLambdaBody lam
-  in lam { extLambdaBody = body
-         , extLambdaParams = extLambdaParams lam
          }

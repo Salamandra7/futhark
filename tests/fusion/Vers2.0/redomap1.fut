@@ -10,11 +10,9 @@
 --   [9.0f32, -6.0f32, -1.2f32]
 -- }
 -- structure {
---      Redomap 1
+--      Screma 1
 -- }
 --
-
-default(f32)
 
 let main(arr: []f32): (f32,[]f32,[]f32,[]f32,[]f32) =
     let xy = map (\(a: f32): (f32,f32)  -> (a+1.0,a+2.0)) arr

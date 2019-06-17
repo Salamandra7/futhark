@@ -1,5 +1,8 @@
 -- An implementation of the venerable Perceptron algorithm.
 --
+-- For clarity, uses very few library functions; in practice the
+-- /futlib/linalg module would probably be useful here.
+--
 -- ==
 -- input {
 --
@@ -35,35 +38,33 @@
 -- 1.000000f32
 -- }
 
-default(f32)
+let dotV [d] (x: [d]f32) (y: [d]f32): f32 =
+  reduce (+) 0.0 (map2 (*) x y)
 
-let dotV (x: [#d]f32) (y: [#d]f32): f32 =
-  reduce (+) 0.0 (map (*) x y)
+let addV [d] (x: [d]f32) (y: [d]f32): [d]f32 =
+  map2 (+) x y
 
-let addV (x: [#d]f32) (y: [#d]f32): [d]f32 =
-  map (+) x y
-
-let scaleV (x: [#d]f32) (a: f32): [d]f32 =
+let scaleV [d] (x: [d]f32) (a: f32): [d]f32 =
   map (*a) x
 
-let checkClass (w: [#d]f32) (x: [#d]f32): f32 =
+let checkClass [d] (w: [d]f32) (x: [d]f32): f32 =
   if dotV x w > 0.0 then 1.0 else -1.0
 
-let checkList (w: [#d]f32) (xs: [#m][#d]f32) (ys: [#m]f32): bool =
-  reduce (&&) true (map (\x y -> checkClass w x * y != -1.0) xs ys)
+let checkList [d][m] (w: [d]f32) (xs: [m][d]f32) (ys: [m]f32): bool =
+  reduce (&&) true (map2 (\x y -> checkClass w x * y != -1.0) xs ys)
 
-let accuracy (w: [#d]f32) (xs: [#m][#d]f32) (ys: [#m]f32): f32 =
-  reduce (+) 0.0 (map (\x y -> f32 (checkClass w x * y != -1.0)) xs ys)
+let accuracy [d][m] (w: [d]f32) (xs: [m][d]f32) (ys: [m]f32): f32 =
+  reduce (+) 0.0 (map2 (\x y -> f32.bool (checkClass w x * y != -1.0)) xs ys)
 
-let train (w: [#d]f32) (x: [#d]f32) (y: f32) (eta: f32): [d]f32 =
+let train [d] (w: [d]f32) (x: [d]f32) (y: f32) (eta: f32): [d]f32 =
   if checkClass w x == y then w
   else addV w (scaleV (scaleV x eta) y)
 
 -- Returns: #iterations, final 'w', accuracy from 0-1.
-let main (w: [#d]f32) (xd: [#m][#d]f32) (yd: [#m]f32) (limit: i32) (eta: f32): (i32, [d]f32, f32) =
-  loop ((w, i) = (w, 0)) = while i < limit && !(checkList w xd yd) do
+let main [d][m] (w: [d]f32) (xd: [m][d]f32) (yd: [m]f32) (limit: i32) (eta: f32): (i32, [d]f32, f32) =
+  let (w,i) = loop (w, i) = (w, 0) while i < limit && !(checkList w xd yd) do
     -- Find data for this iteration.
     let x = xd[i%m]
     let y = yd[i%m]
     in (train w x y eta, i+1)
-  in (i, w, f32(accuracy w xd yd) / f32(m))
+  in (i, w, accuracy w xd yd / r32(m))

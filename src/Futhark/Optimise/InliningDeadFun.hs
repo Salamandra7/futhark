@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleContexts #-}
 -- | This module implements a compiler pass for inlining functions,
 -- then removing those that have become dead.
 module Futhark.Optimise.InliningDeadFun
@@ -6,15 +7,12 @@ module Futhark.Optimise.InliningDeadFun
   )
   where
 
-import Control.Monad.Reader
 import Control.Monad.Identity
-
 import Data.List
+import Data.Loc
 import Data.Maybe
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
-
-import Prelude
 
 import Futhark.Representation.SOACS
 import Futhark.Transform.Rename
@@ -23,12 +21,13 @@ import Futhark.Binder
 import Futhark.Pass
 
 aggInlining :: CallGraph -> [FunDef] -> [FunDef]
-aggInlining cg = filter (isJust . funDefEntryPoint) . recurse
+aggInlining cg = filter keep . recurse
   where noInterestingCalls :: S.Set Name -> FunDef -> Bool
         noInterestingCalls interesting fundec =
           case M.lookup (funDefName fundec) cg of
-            Just calls | not $ any (`elem` interesting) calls -> True
-            _                                                 -> False
+            Just calls | not $ any (`elem` interesting') calls -> True
+            _                                                  -> False
+            where interesting' = funDefName fundec `S.insert` interesting
 
         recurse funs =
           let interesting = S.fromList $ map funDefName funs
@@ -39,6 +38,15 @@ aggInlining cg = filter (isJust . funDefEntryPoint) . recurse
           in if null to_be_inlined then funs
              else inlined_but_entry_points ++
                   recurse (map (`doInlineInCaller` to_be_inlined) to_inline_in)
+
+        keep fundec = isJust (funDefEntryPoint fundec) || callsRecursive fundec
+
+        callsRecursive fundec = maybe False (any recursive) $
+                                M.lookup (funDefName fundec) cg
+
+        recursive fname = case M.lookup fname cg of
+                            Just calls -> fname `elem` calls
+                            Nothing -> False
 
 -- | @doInlineInCaller caller inlcallees@ inlines in @calleer@ the functions
 -- in @inlcallees@. At this point the preconditions are that if @inlcallees@
@@ -52,44 +60,29 @@ doInlineInCaller (FunDef entry name rtp args body) inlcallees =
   in FunDef entry name rtp args body'
 
 inlineInBody :: [FunDef] -> Body -> Body
-inlineInBody
-  inlcallees
-  (Body _ (bnd@(Let pat _ (Apply fname args rtp)):bnds) res) =
-  let continue callbnds =
-        callbnds `insertStms` inlineInBody inlcallees (mkBody bnds res)
-      continue' (Body _ callbnds res') =
-        continue $ callbnds ++
-        zipWith reshapeIfNecessary (patternIdents pat)
-        (runReader (withShapes res') $ scopeOf callbnds)
-  in case filter ((== fname) . funDefName) inlcallees of
-       [] -> continue [bnd]
-       fun:_ ->
-         let revbnds = zip (map paramIdent $ funDefParams fun) $ map fst args
-         in  continue' $ foldr addArgBnd (funDefBody fun) revbnds
-  where
+inlineInBody inlcallees (Body attr stms res) = Body attr stms' res
+  where stms' = stmsFromList (concatMap inline $ stmsToList stms)
 
-      addArgBnd :: (Ident, SubExp) -> Body -> Body
-      addArgBnd (farg, aarg) body =
-        reshapeIfNecessary farg aarg `insertStm` body
+        inline (Let pat aux (Apply fname args _ (safety,loc,locs)))
+          | fun:_ <- filter ((== fname) . funDefName) inlcallees =
+              let param_stms = zipWith reshapeIfNecessary (map paramIdent $ funDefParams fun) (map fst args)
+                  body_stms = stmsToList $ addLocations safety
+                              (filter notNoLoc (loc:locs)) $ bodyStms $ funDefBody fun
+                  res_stms = map (certify $ stmAuxCerts aux) $
+                             zipWith reshapeIfNecessary (patternIdents pat) $
+                             bodyResult $ funDefBody fun
+              in param_stms ++ body_stms ++ res_stms
+        inline stm = [inlineInStm inlcallees stm]
 
-      withShapes ses = do
-        ts <- mapM subExpType ses
-        return $
-          extractShapeContext (retTypeValues rtp) (map arrayDims ts) ++
-          ses
+        reshapeIfNecessary ident se
+          | t@Array{} <- identType ident,
+            Var v <- se =
+              mkLet [] [ident] $ shapeCoerce (arrayDims t) v
+          | otherwise =
+            mkLet [] [ident] $ BasicOp $ SubExp se
 
-      reshapeIfNecessary ident se
-        | t@Array{} <- identType ident,
-          Var v <- se =
-            mkLet' [] [ident] $ shapeCoerce [] (arrayDims t) v
-        | otherwise =
-          mkLet' [] [ident] $ BasicOp $ SubExp se
-inlineInBody inlcallees (Body () (bnd:bnds) res) =
-  let bnd' = inlineInStm inlcallees bnd
-      Body () bnds' res' = inlineInBody inlcallees $ Body () bnds res
-  in Body () (bnd':bnds') res'
-inlineInBody _ (Body () [] res) =
-  Body () [] res
+notNoLoc :: SrcLoc -> Bool
+notNoLoc = (/=NoLoc) . locOf
 
 inliner :: Monad m => [FunDef] -> Mapper SOACS SOACS m
 inliner funs = identityMapper { mapOnBody = const $ return . inlineInBody funs
@@ -99,19 +92,34 @@ inliner funs = identityMapper { mapOnBody = const $ return . inlineInBody funs
 inlineInSOAC :: [FunDef] -> SOAC SOACS -> SOAC SOACS
 inlineInSOAC inlcallees = runIdentity . mapSOACM identitySOACMapper
                           { mapOnSOACLambda = return . inlineInLambda inlcallees
-                          , mapOnSOACExtLambda = return . inlineInExtLambda inlcallees
                           }
 
 inlineInStm :: [FunDef] -> Stm -> Stm
-inlineInStm inlcallees (Let pat () e) = Let pat () $ mapExp (inliner inlcallees) e
+inlineInStm inlcallees (Let pat aux e) =
+  Let pat aux $ mapExp (inliner inlcallees) e
 
 inlineInLambda :: [FunDef] -> Lambda -> Lambda
 inlineInLambda inlcallees (Lambda params body ret) =
   Lambda params (inlineInBody inlcallees body) ret
 
-inlineInExtLambda :: [FunDef] -> ExtLambda -> ExtLambda
-inlineInExtLambda inlcallees (ExtLambda params body ret) =
-  ExtLambda params (inlineInBody inlcallees body) ret
+addLocations :: Safety -> [SrcLoc] -> Stms SOACS -> Stms SOACS
+addLocations caller_safety more_locs = fmap onStm
+  where onStm stm = stm { stmExp = onExp $ stmExp stm }
+        onExp (Apply fname args t (safety, loc,locs)) =
+          Apply fname args t (min caller_safety safety, loc,locs++more_locs)
+        onExp (BasicOp (Assert cond desc (loc,locs))) =
+          case caller_safety of
+            Safe -> BasicOp $ Assert cond desc (loc,locs++more_locs)
+            Unsafe -> BasicOp $ SubExp $ Constant Checked
+        onExp (Op soac) = Op $ runIdentity $ mapSOACM
+                          identitySOACMapper { mapOnSOACLambda = return . onLambda
+                                             } soac
+        onExp e = mapExp identityMapper { mapOnBody = const $ return . onBody
+                                        } e
+        onBody body =
+          body { bodyStms = addLocations caller_safety more_locs $ bodyStms body }
+        onLambda :: Lambda -> Lambda
+        onLambda lam = lam { lambdaBody = onBody $ lambdaBody lam }
 
 -- | A composition of 'inlineAggressively' and 'removeDeadFunctions',
 -- to avoid the cost of type-checking the intermediate stage.
@@ -123,7 +131,7 @@ inlineAndRemoveDeadFunctions =
        }
   where pass prog = do
           let cg = buildCallGraph prog
-          renameProg $ Prog $ aggInlining cg $ progFunctions prog
+          renameProg . Prog . aggInlining cg . progFunctions =<< renameProg prog
 
 -- | @removeDeadFunctions prog@ removes the functions that are unreachable from
 -- the main function from the program.

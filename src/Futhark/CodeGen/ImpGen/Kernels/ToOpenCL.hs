@@ -1,49 +1,57 @@
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TupleSections #-}
 -- | This module defines a translation from imperative code with
 -- kernels to imperative code with OpenCL calls.
 module Futhark.CodeGen.ImpGen.Kernels.ToOpenCL
   ( kernelsToOpenCL
+  , kernelsToCUDA
   )
   where
 
 import Control.Monad.State
 import Control.Monad.Identity
 import Control.Monad.Writer
-import Data.List
+import Control.Monad.Reader
 import Data.Maybe
 import qualified Data.Set as S
 import qualified Data.Map.Strict as M
 
-import Prelude
-
 import qualified Language.C.Syntax as C
 import qualified Language.C.Quote.OpenCL as C
+import qualified Language.C.Quote.CUDA as CUDAC
 
 import Futhark.Error
-import Futhark.Representation.AST.Attributes.Types (int32)
-import qualified Futhark.CodeGen.OpenCL.Kernels as Kernels
 import qualified Futhark.CodeGen.Backends.GenericC as GenericC
 import Futhark.CodeGen.Backends.SimpleRepresentation
-import Futhark.CodeGen.ImpCode.Kernels hiding (Program, GetNumGroups, GetGroupSize, GetTileSize)
+import Futhark.CodeGen.ImpCode.Kernels hiding (Program)
 import qualified Futhark.CodeGen.ImpCode.Kernels as ImpKernels
 import Futhark.CodeGen.ImpCode.OpenCL hiding (Program)
 import qualified Futhark.CodeGen.ImpCode.OpenCL as ImpOpenCL
 import Futhark.MonadFreshNames
 import Futhark.Util (zEncodeString)
-import Futhark.Util.Pretty (pretty, prettyOneLine)
-import Futhark.Util.IntegralExp (quotRoundingUp)
+import Futhark.Util.Pretty (pretty)
+
+kernelsToCUDA, kernelsToOpenCL :: ImpKernels.Program
+                               -> Either InternalError ImpOpenCL.Program
+kernelsToCUDA = translateKernels TargetCUDA
+kernelsToOpenCL = translateKernels TargetOpenCL
 
 -- | Translate a kernels-program to an OpenCL-program.
-kernelsToOpenCL :: ImpKernels.Program
-                -> Either InternalError ImpOpenCL.Program
-kernelsToOpenCL prog = do
-  (prog', ToOpenCL extra_funs kernels requirements) <-
-    runWriterT $ traverse onHostOp prog
+translateKernels :: KernelTarget
+                 -> ImpKernels.Program
+                 -> Either InternalError ImpOpenCL.Program
+translateKernels target (ImpKernels.Functions funs) = do
+  (prog', ToOpenCL extra_funs kernels requirements sizes) <-
+    runWriterT $ fmap Functions $ forM funs $ \(fname, fun) ->
+    (fname,) <$> runReaderT (traverse (onHostOp target) fun) fname
   let kernel_names = M.keys kernels
       opencl_code = openClCode $ M.elems kernels
-      opencl_prelude = pretty $ genOpenClPrelude requirements
-  return $ ImpOpenCL.Program opencl_code opencl_prelude kernel_names $
+      opencl_prelude = pretty $ genPrelude target requirements
+  return $ ImpOpenCL.Program opencl_code opencl_prelude kernel_names
+    (S.toList $ openclUsedTypes requirements) sizes $
     ImpOpenCL.Functions (M.toList extra_funs) <> prog'
+  where genPrelude TargetOpenCL = genOpenClPrelude
+        genPrelude TargetCUDA = genCUDAPrelude
 
 pointerQuals ::  Monad m => String -> m [C.TypeQual]
 pointerQuals "global"     = return [C.ctyquals|__global|]
@@ -55,175 +63,145 @@ pointerQuals "read_only"  = return [C.ctyquals|__read_only|]
 pointerQuals "kernel"     = return [C.ctyquals|__kernel|]
 pointerQuals s            = fail $ "'" ++ s ++ "' is not an OpenCL kernel address space."
 
-type UsedFunctions = [(String,C.Func)] -- The ordering is important!
+newtype KernelRequirements =
+  KernelRequirements { kernelLocalMemory :: [LocalMemoryUse] }
 
-data OpenClRequirements =
-  OpenClRequirements { _kernelUsedFunctions :: UsedFunctions
-                     , _kernelUsedTypes :: S.Set PrimType
-                     , _kernelConstants :: [(VName, KernelConstExp)]
-                     }
+instance Semigroup KernelRequirements where
+  KernelRequirements lm1 <> KernelRequirements lm2 =
+    KernelRequirements (lm1<>lm2)
+
+instance Monoid KernelRequirements where
+  mempty = KernelRequirements mempty
+
+newtype OpenClRequirements =
+  OpenClRequirements { openclUsedTypes :: S.Set PrimType }
+
+instance Semigroup OpenClRequirements where
+  OpenClRequirements ts1 <> OpenClRequirements ts2 =
+    OpenClRequirements (ts1 <> ts2)
 
 instance Monoid OpenClRequirements where
-  mempty = OpenClRequirements mempty mempty mempty
-
-  OpenClRequirements used1 ts1 consts1 `mappend` OpenClRequirements used2 ts2 consts2 =
-    OpenClRequirements (nubBy cmpFst $ used1 <> used2) (ts1 <> ts2) (consts1 <> consts2)
-    where cmpFst (x, _) (y, _) = x == y
+  mempty = OpenClRequirements mempty
 
 data ToOpenCL = ToOpenCL { clExtraFuns :: M.Map Name ImpOpenCL.Function
                          , clKernels :: M.Map KernelName C.Func
                          , clRequirements :: OpenClRequirements
+                         , clSizes :: M.Map Name SizeClass
                          }
 
+instance Semigroup ToOpenCL where
+  ToOpenCL f1 k1 r1 sz1 <> ToOpenCL f2 k2 r2 sz2 =
+    ToOpenCL (f1<>f2) (k1<>k2) (r1<>r2) (sz1<>sz2)
+
 instance Monoid ToOpenCL where
-  mempty =
-    ToOpenCL mempty mempty mempty
-  ToOpenCL f1 k1 r1 `mappend` ToOpenCL f2 k2 r2 =
-    ToOpenCL (f1<>f2) (k1<>k2) (r1<>r2)
+  mempty = ToOpenCL mempty mempty mempty mempty
 
-type OnKernelM = WriterT ToOpenCL (Either InternalError)
+type OnKernelM = ReaderT Name (WriterT ToOpenCL (Either InternalError))
 
-onHostOp :: HostOp -> OnKernelM OpenCL
-onHostOp (CallKernel k) = onKernel k
-onHostOp (ImpKernels.GetNumGroups v) =
-  return $ GetNumGroups v
-onHostOp (ImpKernels.GetGroupSize v) =
-  return $ GetGroupSize v
-onHostOp (ImpKernels.GetTileSize v) =
-  return $ GetTileSize v
+onHostOp :: KernelTarget -> HostOp -> OnKernelM OpenCL
+onHostOp target (CallKernel k) = onKernel target k
+onHostOp _ (ImpKernels.GetSize v key size_class) = do
+  tell mempty { clSizes = M.singleton key size_class }
+  return $ ImpOpenCL.GetSize v key
+onHostOp _ (ImpKernels.CmpSizeLe v key size_class x) = do
+  tell mempty { clSizes = M.singleton key size_class }
+  return $ ImpOpenCL.CmpSizeLe v key x
+onHostOp _ (ImpKernels.GetSizeMax v size_class) =
+  return $ ImpOpenCL.GetSizeMax v size_class
 
-onKernel :: CallKernel -> OnKernelM OpenCL
+onKernel :: KernelTarget -> Kernel -> OnKernelM OpenCL
 
-onKernel called@(Map kernel) = do
-  let (funbody, s) =
-        GenericC.runCompilerM (Functions []) inKernelOperations blankNameSource mempty $ do
-          size <- GenericC.compileExp $ mapKernelSize kernel
-          let check = [C.citem|if ($id:(mapKernelThreadNum kernel) >= $exp:size) return;|]
-          body <- GenericC.blockScope $ GenericC.compileCode $ mapKernelBody kernel
-          return $ check : body
-
-      used_funs = GenericC.compUserState s
-
-      params = mapMaybe useAsParam $ mapKernelUses kernel
-
-      kernel_funs = functionsCalled $ mapKernelBody kernel
-
-  tell ToOpenCL
-    { clExtraFuns = mempty
-    , clKernels = M.singleton (mapKernelName kernel)
-                  [C.cfun|__kernel void $id:(mapKernelName kernel) ($params:params) {
-                     const uint $id:(mapKernelThreadNum kernel) = get_global_id(0);
-                     $items:funbody
-                  }|]
-    , clRequirements = OpenClRequirements
-                       (used_funs ++ requiredFunctions kernel_funs)
-                       (typesInKernel called)
-                       (mapMaybe useAsConst $ mapKernelUses kernel)
-    }
-
-  return $ LaunchKernel
-    (calledKernelName called) (kernelArgs called) kernel_size workgroup_size
-
-  where (kernel_size, workgroup_size) = kernelAndWorkgroupSize called
-
-onKernel called@(AnyKernel kernel) = do
-  let (kernel_body, s) =
-        GenericC.runCompilerM (Functions []) inKernelOperations blankNameSource mempty $
+onKernel target kernel = do
+  let (kernel_body, requirements) =
+        GenericC.runCompilerM mempty inKernelOperations blankNameSource mempty $
         GenericC.blockScope $ GenericC.compileCode $ kernelBody kernel
-
-      used_funs = GenericC.compUserState s
 
       use_params = mapMaybe useAsParam $ kernelUses kernel
 
-      kernel_funs = functionsCalled $ kernelBody kernel
-
-      (local_memory_params, local_memory_init) =
-        unzip $
+      (local_memory_args, local_memory_params, local_memory_init) =
+        unzip3 $
         flip evalState (blankNameSource :: VNameSource) $
-        mapM prepareLocalMemory $ kernelLocalMemory kernel
+        mapM (prepareLocalMemory target) $ kernelLocalMemory $
+        GenericC.compUserState requirements
 
-      params = catMaybes local_memory_params ++ use_params
+      -- CUDA has very strict restrictions on the number of blocks
+      -- permitted along the 'y' and 'z' dimensions of the grid
+      -- (1<<16).  To work around this, we are going to dynamically
+      -- permute the block dimensions to move the largest one to the
+      -- 'x' dimension, which has a higher limit (1<<31).  This means
+      -- we need to extend the kernel with extra parameters that
+      -- contain information about this permutation, but we only do
+      -- this for multidimensional kernels (at the time of this
+      -- writing, only transposes).  The corresponding arguments are
+      -- added automatically in CCUDA.hs.
+      (perm_params, block_dim_init) =
+        case (target, num_groups) of
+          (TargetCUDA, [_, _, _]) -> ([[C.cparam|const int block_dim0|],
+                                       [C.cparam|const int block_dim1|],
+                                       [C.cparam|const int block_dim2|]],
+                                      mempty)
+          _ -> (mempty,
+                [[C.citem|const int block_dim0 = 0;|],
+                 [C.citem|const int block_dim1 = 1;|],
+                 [C.citem|const int block_dim2 = 2;|]])
 
-  tell ToOpenCL { clExtraFuns = mempty
-                , clKernels = M.singleton name
-                              [C.cfun|__kernel void $id:name ($params:params) {
-                                  $items:local_memory_init
-                                  $items:kernel_body
-                                  }|]
-               , clRequirements = OpenClRequirements
-                                  (used_funs ++ requiredFunctions kernel_funs)
-                                  (typesInKernel called)
-                                  (mapMaybe useAsConst $ kernelUses kernel)
-               }
+      params = perm_params ++ catMaybes local_memory_params ++ use_params
 
-  return $ LaunchKernel
-    (calledKernelName called) (kernelArgs called) kernel_size workgroup_size
+      const_defs = mapMaybe constDef $ kernelUses kernel
 
-  where prepareLocalMemory (mem, Left _) = do
+  tell mempty { clExtraFuns = mempty
+              , clKernels = M.singleton name
+                            [C.cfun|__kernel void $id:name ($params:params) {
+                                $items:const_defs
+                                $items:block_dim_init
+                                $items:local_memory_init
+                                $items:kernel_body
+                                }|]
+              , clRequirements = OpenClRequirements (typesInKernel kernel)
+              }
+
+  return $ LaunchKernel name (catMaybes local_memory_args ++ kernelArgs kernel) num_groups group_size
+  where name = nameToString $ kernelName kernel
+        num_groups = kernelNumGroups kernel
+        group_size = kernelGroupSize kernel
+
+        prepareLocalMemory TargetOpenCL (mem, Left size) = do
           mem_aligned <- newVName $ baseString mem ++ "_aligned"
-          return (Just [C.cparam|__local volatile typename int64_t* $id:mem_aligned|],
+          return (Just $ SharedMemoryKArg size,
+                  Just [C.cparam|__local volatile typename int64_t* $id:mem_aligned|],
                   [C.citem|__local volatile char* restrict $id:mem = $id:mem_aligned;|])
-        prepareLocalMemory (mem, Right size) = do
+        prepareLocalMemory TargetOpenCL (mem, Right size) = do
           let size' = compilePrimExp size
-          return (Nothing,
+          return (Nothing, Nothing,
                   [C.citem|ALIGNED_LOCAL_MEMORY($id:mem, $exp:size');|])
-        name = calledKernelName called
-        (kernel_size, workgroup_size) = kernelAndWorkgroupSize called
-
-onKernel (MapTranspose bt
-          destmem destoffset
-          srcmem srcoffset
-          num_arrays x_elems y_elems in_elems out_elems) = do
-  generateTransposeFunction bt
-  return $ HostCode $ Call [] (transposeName bt)
-    [MemArg destmem, ExpArg destoffset,
-     MemArg srcmem, ExpArg srcoffset,
-     ExpArg num_arrays, ExpArg x_elems, ExpArg y_elems,
-     ExpArg in_elems, ExpArg out_elems]
+        prepareLocalMemory TargetCUDA (mem, Left size) = do
+          param <- newVName $ baseString mem ++ "_offset"
+          return (Just $ SharedMemoryKArg size,
+                  Just [C.cparam|uint $id:param|],
+                  [C.citem|volatile char *$id:mem = &shared_mem[$id:param];|])
+        prepareLocalMemory TargetCUDA (mem, Right size) = do
+          -- We declare the shared memory array as int64_t to force alignment.
+          let size' = compilePrimExp size
+          return (Nothing, Nothing,
+                  [CUDAC.citem|__shared__ volatile typename int64_t $id:mem[(($exp:size' + 7) & ~7)/8];|])
 
 useAsParam :: KernelUse -> Maybe C.Param
 useAsParam (ScalarUse name bt) =
-  let ctp = GenericC.primTypeToCType bt
+  let ctp = case bt of
+        -- OpenCL does not permit bool as a kernel parameter type.
+        Bool -> [C.cty|unsigned char|]
+        _    -> GenericC.primTypeToCType bt
   in Just [C.cparam|$ty:ctp $id:name|]
-useAsParam (MemoryUse name _) =
+useAsParam (MemoryUse name) =
   Just [C.cparam|__global unsigned char *$id:name|]
 useAsParam ConstUse{} =
   Nothing
 
-useAsConst :: KernelUse -> Maybe (VName, KernelConstExp)
-useAsConst (ConstUse v e) = Just (v,e)
-useAsConst _ = Nothing
-
-requiredFunctions :: S.Set Name -> [(String, C.Func)]
-requiredFunctions kernel_funs =
-  let used_in_kernel = (`S.member` kernel_funs) . nameFromString . fst
-      funs32_used = filter used_in_kernel funs32
-      funs64_used = filter used_in_kernel funs64
-
-      funs32 = [("log32", c_log32),
-                ("sqrt32", c_sqrt32),
-                ("exp32", c_exp32),
-                ("sin32", c_sin32),
-                ("cos32", c_cos32),
-                ("asin32", c_asin32),
-                ("acos32", c_acos32),
-                ("atan2", c_atan32),
-                ("atan2_32", c_atan2_32),
-                ("isnan32", c_isnan32),
-                ("isinf32", c_isinf32)]
-
-      funs64 = [("log64", c_log64),
-                ("sqrt64", c_sqrt64),
-                ("exp64", c_exp64),
-                ("sin64", c_sin64),
-                ("cos64", c_cos64),
-                ("asin64", c_asin64),
-                ("acos64", c_acos64),
-                ("atan64", c_atan64),
-                ("atan2_64", c_atan2_64),
-                ("isnan64", c_isnan64),
-                ("isinf64", c_isinf64)]
-  in funs32_used ++ funs64_used
+constDef :: KernelUse -> Maybe C.BlockItem
+constDef (ConstUse v e) = Just [C.citem|const $ty:t $id:v = $exp:e';|]
+  where t = GenericC.primTypeToCType $ primExpType e
+        e' = compilePrimExp e
+constDef _ = Nothing
 
 openClCode :: [C.Func] -> String
 openClCode kernels =
@@ -233,7 +211,13 @@ openClCode kernels =
            kernel_func <- kernels ]
 
 genOpenClPrelude :: OpenClRequirements -> [C.Definition]
-genOpenClPrelude (OpenClRequirements used_funs ts consts) =
+genOpenClPrelude (OpenClRequirements ts) =
+  -- Clang-based OpenCL implementations need this for 'static' to work.
+  [ [C.cedecl|$esc:("#ifdef cl_clang_storage_class_specifiers")|]
+  , [C.cedecl|$esc:("#pragma OPENCL EXTENSION cl_clang_storage_class_specifiers : enable")|]
+  , [C.cedecl|$esc:("#endif")|]
+  , [C.cedecl|$esc:("#pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable")|]]
+  ++
   [[C.cedecl|$esc:("#pragma OPENCL EXTENSION cl_khr_fp64 : enable")|] | uses_float64] ++
   [C.cunit|
 /* Some OpenCL programs dislike empty progams, or programs with no kernels.
@@ -254,74 +238,173 @@ typedef ushort uint16_t;
 typedef uint uint32_t;
 typedef ulong uint64_t;
 
-$esc:("#define ALIGNED_LOCAL_MEMORY(m,size) __local unsigned char m[size] __attribute__ ((align))")
+// We declare the shared memory array as int64_t to force alignment.
+$esc:("#define ALIGNED_LOCAL_MEMORY(m,size) __local int64_t m[((size + 7) & ~7)/8]")
+
+// NVIDIAs OpenCL does not create device-wide memory fences (see #734), so we
+// use inline assembly if we detect we are on an NVIDIA GPU.
+$esc:("#ifdef cl_nv_pragma_unroll")
+static inline void mem_fence_global() {
+  asm("membar.gl;");
+}
+$esc:("#else")
+static inline void mem_fence_global() {
+  mem_fence(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+}
+$esc:("#endif")
+static inline void mem_fence_local() {
+  mem_fence(CLK_LOCAL_MEM_FENCE);
+}
 |] ++
-  cIntOps ++ cFloat32Ops ++
-  (if uses_float64 then cFloat64Ops ++ cFloatConvOps else []) ++
-  [ [C.cedecl|$func:used_fun|] | (_, used_fun) <- used_funs ] ++
-  [ [C.cedecl|$esc:def|] | def <- map constToDefine consts ]
+  cIntOps ++ cFloat32Ops ++ cFloat32Funs ++
+  (if uses_float64 then cFloat64Ops ++ cFloat64Funs ++ cFloatConvOps else [])
   where uses_float64 = FloatType Float64 `S.member` ts
-        constToDefine (name, e) =
-          let e' = compilePrimExp e
-          in unwords ["#define", zEncodeString (pretty name), "("++prettyOneLine e'++")"]
+
+
+cudaAtomicOps :: [C.Definition]
+cudaAtomicOps = (return mkOp <*> opNames <*> types) ++ extraOps
+  where
+    mkOp (clName, cuName) t =
+      [C.cedecl|static inline $ty:t $id:clName(volatile $ty:t *p, $ty:t val) {
+                 return $id:cuName(($ty:t *)p, val);
+               }|]
+    types = [ [C.cty|int|]
+            , [C.cty|unsigned int|]
+            , [C.cty|unsigned long long|]
+            ]
+    opNames = [ ("atomic_add",  "atomicAdd")
+              , ("atomic_max",  "atomicMax")
+              , ("atomic_min",  "atomicMin")
+              , ("atomic_and",  "atomicAnd")
+              , ("atomic_or",   "atomicOr")
+              , ("atomic_xor",  "atomicXor")
+              , ("atomic_xchg", "atomicExch")
+              ]
+    extraOps =
+      [ [C.cedecl|static inline $ty:t atomic_cmpxchg(volatile $ty:t *p, $ty:t cmp, $ty:t val) {
+                  return atomicCAS(($ty:t *)p, cmp, val);
+                }|] | t <- types]
+
+genCUDAPrelude :: OpenClRequirements -> [C.Definition]
+genCUDAPrelude (OpenClRequirements _) =
+  cudafy ++ cudaAtomicOps ++ ops
+  where ops = cIntOps ++ cFloat32Ops ++ cFloat32Funs ++ cFloat64Ops
+                ++ cFloat64Funs ++ cFloatConvOps
+        cudafy = [CUDAC.cunit|
+typedef char int8_t;
+typedef short int16_t;
+typedef int int32_t;
+typedef long int64_t;
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+typedef uint8_t uchar;
+typedef uint16_t ushort;
+typedef uint32_t uint;
+typedef uint64_t ulong;
+$esc:("#define __kernel extern \"C\" __global__ __launch_bounds__(MAX_THREADS_PER_BLOCK)")
+$esc:("#define __global")
+$esc:("#define __local")
+$esc:("#define __private")
+$esc:("#define __constant")
+$esc:("#define __write_only")
+$esc:("#define __read_only")
+
+static inline int get_group_id_fn(int block_dim0, int block_dim1, int block_dim2, int d)
+{
+  switch (d) {
+    case 0: d = block_dim0; break;
+    case 1: d = block_dim1; break;
+    case 2: d = block_dim2; break;
+  }
+  switch (d) {
+    case 0: return blockIdx.x;
+    case 1: return blockIdx.y;
+    case 2: return blockIdx.z;
+    default: return 0;
+  }
+}
+$esc:("#define get_group_id(d) get_group_id_fn(block_dim0, block_dim1, block_dim2, d)")
+
+static inline int get_num_groups_fn(int block_dim0, int block_dim1, int block_dim2, int d)
+{
+  switch (d) {
+    case 0: d = block_dim0; break;
+    case 1: d = block_dim1; break;
+    case 2: d = block_dim2; break;
+  }
+  switch(d) {
+    case 0: return gridDim.x;
+    case 1: return gridDim.y;
+    case 2: return gridDim.z;
+    default: return 0;
+  }
+}
+$esc:("#define get_num_groups(d) get_num_groups_fn(block_dim0, block_dim1, block_dim2, d)")
+
+static inline int get_local_id(int d)
+{
+  switch (d) {
+    case 0: return threadIdx.x;
+    case 1: return threadIdx.y;
+    case 2: return threadIdx.z;
+    default: return 0;
+  }
+}
+
+static inline int get_local_size(int d)
+{
+  switch (d) {
+    case 0: return blockDim.x;
+    case 1: return blockDim.y;
+    case 2: return blockDim.z;
+    default: return 0;
+  }
+}
+
+static inline int get_global_id_fn(int block_dim0, int block_dim1, int block_dim2, int d)
+{
+  return get_group_id(d) * get_local_size(d) + get_local_id(d);
+}
+$esc:("#define get_global_id(d) get_global_id_fn(block_dim0, block_dim1, block_dim2, d)")
+
+static inline int get_global_size(int block_dim0, int block_dim1, int block_dim2, int d)
+{
+  return get_num_groups(d) * get_local_size(d);
+}
+
+$esc:("#define CLK_LOCAL_MEM_FENCE 1")
+$esc:("#define CLK_GLOBAL_MEM_FENCE 2")
+static inline void barrier(int x)
+{
+  __syncthreads();
+}
+static inline void mem_fence_local() {
+  __threadfence_block();
+}
+static inline void mem_fence_global() {
+  __threadfence();
+}
+$esc:("#define NAN (0.0/0.0)")
+$esc:("#define INFINITY (1.0/0.0)")
+extern volatile __shared__ char shared_mem[];
+|]
 
 compilePrimExp :: PrimExp KernelConst -> C.Exp
 compilePrimExp e = runIdentity $ GenericC.compilePrimExp compileKernelConst e
-  where compileKernelConst GroupSizeConst = return [C.cexp|DEFAULT_GROUP_SIZE|]
-        compileKernelConst NumGroupsConst = return [C.cexp|DEFAULT_NUM_GROUPS|]
-        compileKernelConst TileSizeConst = return [C.cexp|DEFAULT_TILE_SIZE|]
+  where compileKernelConst (SizeConst key) =
+          return [C.cexp|$id:(zEncodeString (pretty key))|]
 
-mapKernelName :: MapKernel -> String
-mapKernelName k = "kernel_"++ mapKernelDesc k ++ "_" ++
-                  show (baseTag $ mapKernelThreadNum k)
-
-calledKernelName :: CallKernel -> String
-calledKernelName (Map k) =
-  mapKernelName k
-calledKernelName (AnyKernel k) =
-  kernelDesc k ++ "_kernel_" ++ show (baseTag $ kernelName k)
-calledKernelName (MapTranspose bt _ _ _ _ _ _ _ _ _) =
-  transposeKernelName bt Kernels.TransposeNormal
-
-kernelArgs :: CallKernel -> [KernelArg]
-kernelArgs (Map kernel) =
-  mapMaybe useToArg $ mapKernelUses kernel
-kernelArgs (AnyKernel kernel) =
-  mapMaybe (fmap (SharedMemoryKArg . memSizeToExp) . localMemorySize)
-  (kernelLocalMemory kernel) ++
-  mapMaybe useToArg (kernelUses kernel)
-  where localMemorySize (_, Left size) = Just size
-        localMemorySize (_, Right{}) = Nothing
-kernelArgs (MapTranspose bt destmem destoffset srcmem srcoffset _ x_elems y_elems in_elems out_elems) =
-  [ MemKArg destmem
-  , ValueKArg destoffset int32
-  , MemKArg srcmem
-  , ValueKArg srcoffset int32
-  , ValueKArg x_elems int32
-  , ValueKArg y_elems int32
-  , ValueKArg in_elems int32
-  , ValueKArg out_elems int32
-  , SharedMemoryKArg shared_memory
-  ]
-  where shared_memory =
-          bytes $ (transposeBlockDim + 1) * transposeBlockDim *
-          LeafExp (SizeOf bt) (IntType Int32)
-
-kernelAndWorkgroupSize :: CallKernel -> ([Exp], [Exp])
-kernelAndWorkgroupSize (Map kernel) =
-  ([sizeToExp (mapKernelNumGroups kernel) *
-    sizeToExp (mapKernelGroupSize kernel)],
-   [sizeToExp $ mapKernelGroupSize kernel])
-kernelAndWorkgroupSize (AnyKernel kernel) =
-  ([sizeToExp (kernelNumGroups kernel) *
-    sizeToExp (kernelGroupSize kernel)],
-   [sizeToExp $ kernelGroupSize kernel])
-kernelAndWorkgroupSize (MapTranspose _ _ _ _ _ num_arrays x_elems y_elems _ _) =
-  transposeKernelAndGroupSize num_arrays x_elems y_elems
+kernelArgs :: Kernel -> [KernelArg]
+kernelArgs = mapMaybe useToArg . kernelUses
+  where useToArg (MemoryUse mem)  = Just $ MemKArg mem
+        useToArg (ScalarUse v bt) = Just $ ValueKArg (LeafExp (ScalarVar v) bt) bt
+        useToArg ConstUse{}       = Nothing
 
 --- Generating C
 
-inKernelOperations :: GenericC.Operations KernelOp UsedFunctions
+inKernelOperations :: GenericC.Operations KernelOp KernelRequirements
 inKernelOperations = GenericC.Operations
                      { GenericC.opsCompiler = kernelOps
                      , GenericC.opsMemoryType = kernelMemoryType
@@ -330,9 +413,10 @@ inKernelOperations = GenericC.Operations
                      , GenericC.opsAllocate = cannotAllocate
                      , GenericC.opsDeallocate = cannotDeallocate
                      , GenericC.opsCopy = copyInKernel
+                     , GenericC.opsStaticArray = noStaticArrays
                      , GenericC.opsFatMemory = False
                      }
-  where kernelOps :: GenericC.OpCompiler KernelOp UsedFunctions
+  where kernelOps :: GenericC.OpCompiler KernelOp KernelRequirements
         kernelOps (GetGroupId v i) =
           GenericC.stm [C.cstm|$id:v = get_group_id($int:i);|]
         kernelOps (GetLocalId v i) =
@@ -345,210 +429,98 @@ inKernelOperations = GenericC.Operations
           GenericC.stm [C.cstm|$id:v = get_global_size($int:i);|]
         kernelOps (GetLockstepWidth v) =
           GenericC.stm [C.cstm|$id:v = LOCKSTEP_WIDTH;|]
-        kernelOps Barrier =
+        kernelOps LocalBarrier =
           GenericC.stm [C.cstm|barrier(CLK_LOCAL_MEM_FENCE);|]
+        kernelOps GlobalBarrier =
+          GenericC.stm [C.cstm|barrier(CLK_GLOBAL_MEM_FENCE);|]
+        kernelOps MemFenceLocal =
+          GenericC.stm [C.cstm|mem_fence_local();|]
+        kernelOps MemFenceGlobal =
+          GenericC.stm [C.cstm|mem_fence_global();|]
+        kernelOps (PrivateAlloc name size) = do
+          size' <- GenericC.compileExp $ innerExp size
+          name' <- newVName $ pretty name ++ "_backing"
+          GenericC.item [C.citem|__private char $id:name'[$exp:size'];|]
+          GenericC.stm [C.cstm|$id:name = $id:name';|]
+        kernelOps (LocalAlloc name size) = do
+          name' <- newVName $ pretty name ++ "_backing"
+          GenericC.modifyUserState (<>KernelRequirements [(name', size)])
+          GenericC.stm [C.cstm|$id:name = (__local char*) $id:name';|]
+        kernelOps (Atomic space aop) = atomicOps space aop
 
-        cannotAllocate :: GenericC.Allocate KernelOp UsedFunctions
+        atomicCast s t = do
+          let volatile = [C.ctyquals|volatile|]
+          quals <- case s of DefaultSpace -> pointerQuals "global"
+                             Space sid    -> pointerQuals sid
+          return [C.cty|$tyquals:(volatile++quals) $ty:t|]
+
+        doAtomic s old arr ind val op ty = do
+          ind' <- GenericC.compileExp $ innerExp ind
+          val' <- GenericC.compileExp val
+          cast <- atomicCast s ty
+          GenericC.stm [C.cstm|$id:old = $id:op(&(($ty:cast *)$id:arr)[$exp:ind'], ($ty:ty) $exp:val');|]
+
+        atomicOps s (AtomicAdd old arr ind val) =
+          doAtomic s old arr ind val "atomic_add" [C.cty|int|]
+
+        atomicOps s (AtomicSMax old arr ind val) =
+          doAtomic s old arr ind val "atomic_max" [C.cty|int|]
+
+        atomicOps s (AtomicSMin old arr ind val) =
+          doAtomic s old arr ind val "atomic_min" [C.cty|int|]
+
+        atomicOps s (AtomicUMax old arr ind val) =
+          doAtomic s old arr ind val "atomic_max" [C.cty|unsigned int|]
+
+        atomicOps s (AtomicUMin old arr ind val) =
+          doAtomic s old arr ind val "atomic_min" [C.cty|unsigned int|]
+
+        atomicOps s (AtomicAnd old arr ind val) =
+          doAtomic s old arr ind val "atomic_and" [C.cty|unsigned int|]
+
+        atomicOps s (AtomicOr old arr ind val) =
+          doAtomic s old arr ind val "atomic_or" [C.cty|unsigned int|]
+
+        atomicOps s (AtomicXor old arr ind val) =
+          doAtomic s old arr ind val "atomic_xor" [C.cty|unsigned int|]
+
+        atomicOps s (AtomicCmpXchg old arr ind cmp val) = do
+          ind' <- GenericC.compileExp $ innerExp ind
+          cmp' <- GenericC.compileExp cmp
+          val' <- GenericC.compileExp val
+          cast <- atomicCast s [C.cty|int|]
+          GenericC.stm [C.cstm|$id:old = atomic_cmpxchg(&(($ty:cast *)$id:arr)[$exp:ind'], $exp:cmp', $exp:val');|]
+
+        atomicOps s (AtomicXchg old arr ind val) = do
+          ind' <- GenericC.compileExp $ innerExp ind
+          val' <- GenericC.compileExp val
+          cast <- atomicCast s [C.cty|int|]
+          GenericC.stm [C.cstm|$id:old = atomic_xchg(&(($ty:cast *)$id:arr)[$exp:ind'], $exp:val');|]
+
+        cannotAllocate :: GenericC.Allocate KernelOp KernelRequirements
         cannotAllocate _ =
           fail "Cannot allocate memory in kernel"
 
-        cannotDeallocate :: GenericC.Deallocate KernelOp UsedFunctions
+        cannotDeallocate :: GenericC.Deallocate KernelOp KernelRequirements
         cannotDeallocate _ _ =
           fail "Cannot deallocate memory in kernel"
 
-        copyInKernel :: GenericC.Copy KernelOp UsedFunctions
+        copyInKernel :: GenericC.Copy KernelOp KernelRequirements
         copyInKernel _ _ _ _ _ _ _ =
           fail "Cannot bulk copy in kernel."
+
+        noStaticArrays :: GenericC.StaticArray KernelOp KernelRequirements
+        noStaticArrays _ _ _ _ =
+          fail "Cannot create static array in kernel."
 
         kernelMemoryType space = do
           quals <- pointerQuals space
           return [C.cty|$tyquals:quals $ty:defaultMemBlockType|]
 
---- Handling transpositions
-
-transposeKernelName :: PrimType -> Kernels.TransposeType -> String
-transposeKernelName bt Kernels.TransposeNormal =
-  "fut_kernel_map_transpose_" ++ pretty bt
-transposeKernelName bt Kernels.TransposeLowWidth =
-  "fut_kernel_map_transpose_lowwidth_" ++ pretty bt
-transposeKernelName bt Kernels.TransposeLowHeight =
-  "fut_kernel_map_transpose_lowheight_" ++ pretty bt
-
-transposeName :: PrimType -> Name
-transposeName bt = nameFromString $ "map_transpose_opencl_" ++ pretty bt
-
-generateTransposeFunction :: PrimType -> OnKernelM ()
-generateTransposeFunction bt =
-  -- We have special functions to handle transposing an input array with low
-  -- width or low height, as this would cause very few threads to be active. See
-  -- comment in Futhark.CodeGen.OpenCL.OpenCL.Kernels.hs for more details.
-
-  tell ToOpenCL
-    { clExtraFuns = M.singleton (transposeName bt) $
-                    ImpOpenCL.Function False [] params transpose_code [] []
-    , clKernels = M.fromList $
-        map (\tt -> let name = transposeKernelName bt tt
-                    in (name, Kernels.mapTranspose name bt' tt))
-        [Kernels.TransposeNormal, Kernels.TransposeLowWidth,
-         Kernels.TransposeLowHeight]
-
-    , clRequirements = mempty
-    }
-  where bt' = GenericC.primTypeToCType bt
-        space = ImpOpenCL.Space "device"
-        memparam s i = MemParam (VName (nameFromString s) i) space
-        intparam s i = ScalarParam (VName (nameFromString s) i) $ IntType Int32
-
-        params = [destmem_p, destoffset_p, srcmem_p, srcoffset_p,
-                num_arrays_p, x_p, y_p, in_p, out_p]
-
-        [destmem_p, destoffset_p, srcmem_p, srcoffset_p,
-                num_arrays_p, x_p, y_p, in_p, out_p,
-                muly, new_height, mulx, new_width] =
-          zipWith ($) [memparam "destmem",
-                       intparam "destoffset",
-                       memparam "srcmem",
-                       intparam "srcoffset",
-                       intparam "num_arrays",
-                       intparam "x_elems",
-                       intparam "y_elems",
-                       intparam "in_elems",
-                       intparam "out_elems",
-                       -- The following is only used for low width/height
-                       -- transpose kernels
-                       intparam "muly",
-                       intparam "new_height",
-                       intparam "mulx",
-                       intparam "new_width"
-                      ]
-                      [0..]
-
-        asExp param =
-          ImpOpenCL.LeafExp (ImpOpenCL.ScalarVar (paramName param)) (IntType Int32)
-
-        asArg (MemParam name _) =
-          MemKArg name
-        asArg (ScalarParam name t) =
-          ValueKArg (ImpOpenCL.LeafExp (ImpOpenCL.ScalarVar name) t) t
-
-        normal_kernel_args =
-          map asArg [destmem_p, destoffset_p, srcmem_p, srcoffset_p,
-                     x_p, y_p, in_p, out_p] ++
-          [SharedMemoryKArg shared_memory]
-
-        lowwidth_kernel_args =
-          map asArg [destmem_p, destoffset_p, srcmem_p, srcoffset_p,
-                     x_p, y_p, in_p, out_p, muly] ++
-          [SharedMemoryKArg shared_memory]
-
-        lowheight_kernel_args =
-          map asArg [destmem_p, destoffset_p, srcmem_p, srcoffset_p,
-                     x_p, y_p, in_p, out_p, mulx] ++
-          [SharedMemoryKArg shared_memory]
-
-        shared_memory =
-          bytes $ (transposeBlockDim + 1) * transposeBlockDim *
-          LeafExp (SizeOf bt) (IntType Int32)
-
-        transposeBlockDimDivTwo = BinOpExp (SQuot Int32) transposeBlockDim 2
-
-        should_use_lowwidth = BinOpExp LogAnd
-          (CmpOpExp (CmpSle Int32) (asExp x_p) transposeBlockDimDivTwo)
-          (CmpOpExp (CmpSlt Int32) transposeBlockDim (asExp y_p))
-
-        should_use_lowheight = BinOpExp LogAnd
-          (CmpOpExp (CmpSle Int32) (asExp y_p) transposeBlockDimDivTwo)
-          (CmpOpExp (CmpSlt Int32) transposeBlockDim (asExp x_p))
-
-        -- When an input array has either width==1 or height==1, performing a
-        -- transpose will be the same as performing a copy.  If 'input_size' or
-        -- 'output_size' is not equal to width*height, then this trick will not
-        -- work when there are more than one array to process, as it is a per
-        -- array limit. We could copy each array individually, but currently we
-        -- do not.
-        can_use_copy =
-          let in_out_eq = CmpOpExp (CmpEq $ IntType Int32) (asExp in_p) (asExp out_p)
-              onearr = CmpOpExp (CmpEq $ IntType Int32) (asExp num_arrays_p) 1
-              noprob_widthheight = CmpOpExp (CmpEq $ IntType Int32)
-                                     (asExp x_p * asExp y_p)
-                                     (asExp in_p)
-              height_is_one = CmpOpExp (CmpEq $ IntType Int32) (asExp y_p) 1
-              width_is_one = CmpOpExp (CmpEq $ IntType Int32) (asExp x_p) 1
-          in BinOpExp LogAnd
-               in_out_eq
-               (BinOpExp LogAnd
-                 (BinOpExp LogOr onearr noprob_widthheight)
-                 (BinOpExp LogOr width_is_one height_is_one))
-
-        transpose_code =
-          ImpOpenCL.If can_use_copy
-            copy_code
-            (ImpOpenCL.If should_use_lowwidth
-              lowwidth_transpose_code
-              (ImpOpenCL.If should_use_lowheight
-                lowheight_transpose_code
-                normal_transpose_code))
-
-        copy_code =
-          let num_bytes =
-                asExp in_p * ImpOpenCL.LeafExp (ImpOpenCL.SizeOf bt) (IntType Int32)
-          in ImpOpenCL.Copy
-               (paramName destmem_p) (Count $ asExp destoffset_p) space
-               (paramName srcmem_p) (Count $ asExp srcoffset_p) space
-               (Count num_bytes)
-
-        normal_transpose_code =
-          let (kernel_size, workgroup_size) =
-                transposeKernelAndGroupSize (asExp num_arrays_p) (asExp x_p) (asExp y_p)
-          in ImpOpenCL.Op $ LaunchKernel
-             (transposeKernelName bt Kernels.TransposeNormal) normal_kernel_args kernel_size workgroup_size
-
-        lowwidth_transpose_code =
-          let set_muly = DeclareScalar (paramName muly) (IntType Int32)
-                        :>>: SetScalar (paramName muly) (BinOpExp (SQuot Int32) transposeBlockDim (asExp x_p))
-              set_new_height = DeclareScalar (paramName new_height) (IntType Int32)
-                :>>: SetScalar (paramName new_height) (asExp y_p `quotRoundingUp` asExp muly)
-              (kernel_size, workgroup_size) =
-                transposeKernelAndGroupSize (asExp num_arrays_p) (asExp x_p) (asExp new_height)
-              launch = ImpOpenCL.Op $ LaunchKernel
-                (transposeKernelName bt Kernels.TransposeLowWidth) lowwidth_kernel_args kernel_size workgroup_size
-          in set_muly :>>: set_new_height :>>: launch
-
-        lowheight_transpose_code =
-          let set_mulx = DeclareScalar (paramName mulx) (IntType Int32)
-                        :>>: SetScalar (paramName mulx) (BinOpExp (SQuot Int32) transposeBlockDim (asExp y_p))
-              set_new_width = DeclareScalar (paramName new_width) (IntType Int32)
-                :>>: SetScalar (paramName new_width) (asExp x_p `quotRoundingUp` asExp mulx)
-              (kernel_size, workgroup_size) =
-                transposeKernelAndGroupSize (asExp num_arrays_p) (asExp new_width) (asExp y_p)
-              launch = ImpOpenCL.Op $ LaunchKernel
-                (transposeKernelName bt Kernels.TransposeLowHeight) lowheight_kernel_args kernel_size workgroup_size
-          in set_mulx :>>: set_new_width :>>: launch
-
-transposeKernelAndGroupSize :: ImpOpenCL.Exp -> ImpOpenCL.Exp -> ImpOpenCL.Exp
-                            -> ([ImpOpenCL.Exp], [ImpOpenCL.Exp])
-transposeKernelAndGroupSize num_arrays x_elems y_elems =
-  ([roundedToBlockDim x_elems,
-    roundedToBlockDim y_elems,
-    num_arrays],
-   [transposeBlockDim, transposeBlockDim, 1])
-  where roundedToBlockDim e =
-          e + ((transposeBlockDim -
-                (e `impRem` transposeBlockDim)) `impRem`
-               transposeBlockDim)
-        impRem = BinOpExp $ SRem Int32
-
 --- Checking requirements
 
-useToArg :: KernelUse -> Maybe KernelArg
-useToArg (MemoryUse mem _) = Just $ MemKArg mem
-useToArg (ScalarUse v bt)  = Just $ ValueKArg (LeafExp (ScalarVar v) bt) bt
-useToArg ConstUse{}        = Nothing
-
-typesInKernel :: CallKernel -> S.Set PrimType
-typesInKernel (Map kernel) = typesInCode $ mapKernelBody kernel
-typesInKernel (AnyKernel kernel) = typesInCode $ kernelBody kernel
-typesInKernel MapTranspose{} = mempty
+typesInKernel :: Kernel -> S.Set PrimType
+typesInKernel kernel = typesInCode $ kernelBody kernel
 
 typesInCode :: ImpKernels.KernelCode -> S.Set PrimType
 typesInCode Skip = mempty
@@ -557,10 +529,12 @@ typesInCode (For _ it e c) = IntType it `S.insert` typesInExp e <> typesInCode c
 typesInCode (While e c) = typesInExp e <> typesInCode c
 typesInCode DeclareMem{} = mempty
 typesInCode (DeclareScalar _ t) = S.singleton t
+typesInCode (DeclareArray _ _ t _) = S.singleton t
 typesInCode (Allocate _ (Count e) _) = typesInExp e
+typesInCode Free{} = mempty
 typesInCode (Copy _ (Count e1) _ _ (Count e2) _ (Count e3)) =
   typesInExp e1 <> typesInExp e2 <> typesInExp e3
-typesInCode (Scatter _ (Count e1) t _ _ e2) =
+typesInCode (Write _ (Count e1) t _ _ e2) =
   typesInExp e1 <> S.singleton t <> typesInExp e2
 typesInCode (SetScalar _ e) = typesInExp e
 typesInCode SetMem{} = mempty
@@ -569,9 +543,9 @@ typesInCode (Call _ _ es) = mconcat $ map typesInArg es
         typesInArg (ExpArg e) = typesInExp e
 typesInCode (If e c1 c2) =
   typesInExp e <> typesInCode c1 <> typesInCode c2
-typesInCode (Assert e _) = typesInExp e
+typesInCode (Assert e _ _) = typesInExp e
 typesInCode (Comment _ c) = typesInCode c
-typesInCode (DebugPrint _ _ e) = typesInExp e
+typesInCode (DebugPrint _ v) = maybe mempty (typesInExp . snd) v
 typesInCode Op{} = mempty
 
 typesInExp :: Exp -> S.Set PrimType
@@ -579,8 +553,9 @@ typesInExp (ValueExp v) = S.singleton $ primValueType v
 typesInExp (BinOpExp _ e1 e2) = typesInExp e1 <> typesInExp e2
 typesInExp (CmpOpExp _ e1 e2) = typesInExp e1 <> typesInExp e2
 typesInExp (ConvOpExp op e) = S.fromList [from, to] <> typesInExp e
-  where (from, to) = convTypes op
+  where (from, to) = convOpType op
 typesInExp (UnOpExp _ e) = typesInExp e
+typesInExp (FunExp _ args t) = S.singleton t <> mconcat (map typesInExp args)
 typesInExp (LeafExp (Index _ (Count e) t _ _) _) = S.singleton t <> typesInExp e
 typesInExp (LeafExp ScalarVar{} _) = mempty
 typesInExp (LeafExp (SizeOf t) _) = S.singleton t

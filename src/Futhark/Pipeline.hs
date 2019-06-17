@@ -6,6 +6,7 @@ module Futhark.Pipeline
 
        , FutharkM
        , runFutharkM
+       , Verbosity(..)
 
        , internalErrorS
 
@@ -18,7 +19,6 @@ module Futhark.Pipeline
        )
        where
 
-import Control.Applicative
 import Control.Category
 import Control.Monad
 import Control.Monad.Writer.Strict hiding (pass)
@@ -27,7 +27,9 @@ import Control.Monad.State
 import Control.Monad.Reader
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
+import Data.Time.Clock
 import System.IO
+import Text.Printf
 
 import Prelude hiding (id, (.))
 
@@ -39,29 +41,42 @@ import Futhark.Util.Log
 import Futhark.Util.Pretty (Pretty, prettyText)
 import Futhark.MonadFreshNames
 
-newtype FutharkEnv = FutharkEnv {
-  futharkVerbose :: Bool
-  -- ^ If true, print log messages to standard error.
-  }
+-- | If Verbose, print log messages to standard error.  If
+-- VeryVerbose, also print logs from individual passes.
+data Verbosity = NotVerbose | Verbose | VeryVerbose deriving (Eq, Ord)
 
-newtype FutharkM a = FutharkM (ExceptT CompilerError (StateT VNameSource (ReaderT FutharkEnv IO)) a)
+newtype FutharkEnv = FutharkEnv { futharkVerbose :: Verbosity }
+
+data FutharkState = FutharkState { futharkPrevLog :: UTCTime
+                                 , futharkNameSource :: VNameSource }
+
+newtype FutharkM a = FutharkM (ExceptT CompilerError (StateT FutharkState (ReaderT FutharkEnv IO)) a)
                      deriving (Applicative, Functor, Monad,
                                MonadError CompilerError,
-                               MonadState VNameSource,
+                               MonadState FutharkState,
                                MonadReader FutharkEnv,
                                MonadIO)
 
 instance MonadFreshNames FutharkM where
-  getNameSource = get
-  putNameSource = put
+  getNameSource = gets futharkNameSource
+  putNameSource src = modify $ \s -> s { futharkNameSource = src }
 
 instance MonadLogger FutharkM where
-  addLog msg = do verb <- asks futharkVerbose
-                  when verb $ liftIO $ T.hPutStr stderr $ toText msg
+  addLog = mapM_ perLine . T.lines . toText
+    where perLine msg = do
+            verb <- asks $ (>=Verbose) . futharkVerbose
+            prev <- gets futharkPrevLog
+            now <- liftIO getCurrentTime
+            let delta :: Double
+                delta = fromRational $ toRational (now `diffUTCTime` prev)
+                prefix = printf "[  +%.6f] " delta
+            modify $ \s -> s { futharkPrevLog = now }
+            when verb $ liftIO $ T.hPutStrLn stderr $ T.pack prefix <> msg
 
-runFutharkM :: FutharkM a -> Bool -> IO (Either CompilerError a)
-runFutharkM (FutharkM m) verbose =
-  runReaderT (evalStateT (runExceptT m) blankNameSource) newEnv
+runFutharkM :: FutharkM a -> Verbosity -> IO (Either CompilerError a)
+runFutharkM (FutharkM m) verbose = do
+  s <- FutharkState <$> getCurrentTime <*> pure blankNameSource
+  runReaderT (evalStateT (runExceptT m) s) newEnv
   where newEnv = FutharkEnv verbose
 
 internalErrorS :: Pretty t => String -> t -> FutharkM a
@@ -133,6 +148,7 @@ runPass :: PrettyLore fromlore =>
         -> FutharkM (Prog tolore)
 runPass pass prog = do
   (res, logged) <- runPassM (passFunction pass prog)
-  addLog logged
-  case res of Left err -> throwError $ InternalError err (prettyText prog) CompilerBug
+  verb <- asks $ (>=VeryVerbose) . futharkVerbose
+  when verb $ addLog logged
+  case res of Left err -> internalError err $ prettyText prog
               Right x  -> return x

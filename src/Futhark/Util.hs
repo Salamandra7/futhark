@@ -11,18 +11,45 @@ module Futhark.Util
         chunk,
         chunks,
         dropAt,
+        takeLast,
+        dropLast,
         mapEither,
         maybeNth,
+        maybeHead,
+        splitFromEnd,
         splitAt3,
+        splitAt4,
         focusNth,
+        unixEnvironment,
+        isEnvVarSet,
+        runProgramWithExitCode,
+        directoryContents,
+        roundFloat,
+        roundDouble,
+        lgamma, lgammaf, tgamma, tgammaf,
+        fromPOSIX,
+        toPOSIX,
+        trim,
+        pmapIO,
         zEncodeString
        )
        where
 
 import Numeric
+import Control.Concurrent
+import Control.Exception
+import Control.Monad
 import Data.Char
 import Data.List
 import Data.Either
+import Data.Maybe
+import System.Environment
+import System.IO.Unsafe
+import qualified System.Directory.Tree as Dir
+import System.Process
+import System.Exit
+import qualified System.FilePath.Posix as Posix
+import qualified System.FilePath as Native
 
 -- | Like 'mapAccumL', but monadic.
 mapAccumLM :: Monad m =>
@@ -55,6 +82,14 @@ chunks (n:ns) xs =
 dropAt :: Int -> Int -> [a] -> [a]
 dropAt i n xs = take i xs ++ drop (i+n) xs
 
+-- | @takeLast n l@ takes the last @n@ elements of @l@.
+takeLast :: Int -> [a] -> [a]
+takeLast n = reverse . take n . reverse
+
+-- | @dropLast n l@ drops the last @n@ elements of @l@.
+dropLast :: Int -> [a] -> [a]
+dropLast n = reverse . drop n . reverse
+
 -- | A combination of 'map' and 'partitionEithers'.
 mapEither :: (a -> Either b c) -> [a] -> ([b], [c])
 mapEither f l = partitionEithers $ map f l
@@ -65,6 +100,15 @@ maybeNth i l
   | i >= 0, v:_ <- genericDrop i l = Just v
   | otherwise                      = Nothing
 
+-- | Return the first element of the list, if it exists.
+maybeHead :: [a] -> Maybe a
+maybeHead [] = Nothing
+maybeHead (x:_) = Just x
+
+-- | Like 'splitAt', but from the end.
+splitFromEnd :: Int -> [a] -> ([a], [a])
+splitFromEnd i l = splitAt (length l - i) l
+
 -- | Like 'splitAt', but produces three lists.
 splitAt3 :: Int -> Int -> [a] -> ([a], [a], [a])
 splitAt3 n m l =
@@ -72,12 +116,118 @@ splitAt3 n m l =
       (ys, zs) = splitAt m l'
   in (xs, ys, zs)
 
+-- | Like 'splitAt', but produces four lists.
+splitAt4 :: Int -> Int -> Int -> [a] -> ([a], [a], [a], [a])
+splitAt4 n m k l =
+  let (xs, l') = splitAt n l
+      (ys, l'') = splitAt m l'
+      (zs, vs) = splitAt k l''
+  in (xs, ys, zs, vs)
+
 -- | Return the list element at the given index, if the index is
 -- valid, along with the elements before and after.
 focusNth :: Integral int => int -> [a] -> Maybe ([a], a, [a])
 focusNth i xs
   | (bef, x:aft) <- genericSplitAt i xs = Just (bef, x, aft)
   | otherwise                           = Nothing
+
+{-# NOINLINE unixEnvironment #-}
+-- | The Unix environment when the Futhark compiler started.
+unixEnvironment :: [(String,String)]
+unixEnvironment = unsafePerformIO getEnvironment
+
+-- Is an environment variable set to 0 or 1?  If 0, return False; if 1, True;
+-- otherwise the default value.
+isEnvVarSet :: String -> Bool -> Bool
+isEnvVarSet name default_val = fromMaybe default_val $ do
+  val <- lookup name unixEnvironment
+  case val of
+    "0" -> return False
+    "1" -> return True
+    _ -> Nothing
+
+-- | Like 'readProcessWithExitCode', but also wraps exceptions when
+-- the indicated binary cannot be launched, or some other exception is
+-- thrown.
+runProgramWithExitCode :: FilePath -> [String] -> String
+                       -> IO (Either IOException (ExitCode, String, String))
+runProgramWithExitCode exe args inp =
+  (Right <$> readProcessWithExitCode exe args inp)
+  `catch` \e -> return (Left e)
+
+-- | Every non-directory file contained in a directory tree.
+directoryContents :: FilePath -> IO [FilePath]
+directoryContents dir = do
+  _ Dir.:/ tree <- Dir.readDirectoryWith return dir
+  case Dir.failures tree of
+    Dir.Failed _ err : _ -> throw err
+    _ -> return $ mapMaybe isFile $ Dir.flattenDir tree
+  where isFile (Dir.File _ path) = Just path
+        isFile _                 = Nothing
+
+foreign import ccall "nearbyint" c_nearbyint :: Double -> Double
+foreign import ccall "nearbyintf" c_nearbyintf :: Float -> Float
+
+-- | Round a single-precision floating point number correctly.
+roundFloat :: Float -> Float
+roundFloat = c_nearbyintf
+
+-- | Round a double-precision floating point number correctly.
+roundDouble :: Double -> Double
+roundDouble = c_nearbyint
+
+foreign import ccall "lgamma" c_lgamma :: Double -> Double
+foreign import ccall "lgammaf" c_lgammaf :: Float -> Float
+foreign import ccall "tgamma" c_tgamma :: Double -> Double
+foreign import ccall "tgammaf" c_tgammaf :: Float -> Float
+
+-- | The system-level @lgamma()@ function.
+lgamma :: Double -> Double
+lgamma = c_lgamma
+
+-- | The system-level @lgammaf()@ function.
+lgammaf :: Float -> Float
+lgammaf = c_lgammaf
+
+-- | The system-level @tgamma()@ function.
+tgamma :: Double -> Double
+tgamma = c_tgamma
+
+-- | The system-level @tgammaf()@ function.
+tgammaf :: Float -> Float
+tgammaf = c_tgammaf
+
+-- | Turn a POSIX filepath into a filepath for the native system.
+toPOSIX :: Native.FilePath -> Posix.FilePath
+toPOSIX = Posix.joinPath . Native.splitDirectories
+
+-- | Some bad operating systems do not use forward slash as
+-- directory separator - this is where we convert Futhark includes
+-- (which always use forward slash) to native paths.
+fromPOSIX :: Posix.FilePath -> Native.FilePath
+fromPOSIX = Native.joinPath . Posix.splitDirectories
+
+-- | Remove leading and trailing whitespace from a string.  Not an
+-- efficient implementation!
+trim :: String -> String
+trim = reverse . dropWhile isSpace . reverse . dropWhile isSpace
+
+fork :: (a -> IO b) -> a -> IO (MVar b)
+fork f x = do cell <- newEmptyMVar
+              void $ forkIO $ do result <- f x
+                                 putMVar cell result
+              return cell
+
+pmapIO :: (a -> IO b) -> [a] -> IO [b]
+pmapIO f elems = go elems []
+  where
+    go [] res = return res
+    go xs res = do
+      numThreads <- getNumCapabilities
+      let (e,es) = splitAt numThreads xs
+      mvars  <- mapM (fork f) e
+      result <- mapM takeMVar mvars
+      go es (result ++ res)
 
 -- Z-encoding from https://ghc.haskell.org/trac/ghc/wiki/Commentary/Compiler/SymbolNames
 --

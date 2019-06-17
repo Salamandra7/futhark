@@ -21,4 +21,4 @@
 
 
 let main(n: u8): []i32 =
-  replicate n 42
+  u8.replicate n 42

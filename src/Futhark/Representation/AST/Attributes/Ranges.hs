@@ -23,11 +23,9 @@ module Futhark.Representation.AST.Attributes.Ranges
        )
        where
 
-import Data.Monoid
+import Data.Monoid ((<>))
 import qualified Data.Set as S
 import qualified Data.Map.Strict as M
-
-import Prelude
 
 import Futhark.Representation.AST.Attributes
 import Futhark.Representation.AST.Syntax
@@ -78,7 +76,7 @@ instance PP.Pretty KnownBound where
   ppr (MinimumBound b1 b2) =
     PP.text "min" <> PP.parens (PP.ppr b1 <> PP.comma PP.<+> PP.ppr b2)
   ppr (MaximumBound b1 b2) =
-    PP.text "min" <> PP.parens (PP.ppr b1 <> PP.comma PP.<+> PP.ppr b2)
+    PP.text "max" <> PP.parens (PP.ppr b1 <> PP.comma PP.<+> PP.ppr b2)
   ppr (ScalarBound e) =
     PP.ppr e
 
@@ -161,7 +159,7 @@ instance RangeOf attr => RangesOf (PatternT attr) where
   rangesOf = map rangeOf . patternElements
 
 instance Ranged lore => RangesOf (Body lore) where
-  rangesOf = rangesOf . bodyLore
+  rangesOf = rangesOf . bodyAttr
 
 subExpKnownRange :: SubExp -> (KnownBound, KnownBound)
 subExpKnownRange (Var v) =
@@ -206,16 +204,12 @@ primOpRanges (Iota n x s Int32) =
           Constant val -> SE.Val val
 primOpRanges (Replicate _ v) =
   [rangeOf v]
-primOpRanges (Rearrange _ _ v) =
+primOpRanges (Rearrange _ v) =
   [rangeOf $ Var v]
-primOpRanges (Split _ _ sizeexps v) =
-  replicate (length sizeexps) $ rangeOf $ Var v
 primOpRanges (Copy se) =
   [rangeOf $ Var se]
-primOpRanges (Index _ v _) =
+primOpRanges (Index v _) =
   [rangeOf $ Var v]
-primOpRanges (Partition _ n _ arr) =
-  replicate n unknownRange ++ map (rangeOf . Var) arr
 primOpRanges (ArrayLit (e:es) _) =
   [(Just lower, Just upper)]
   where (e_lower, e_upper) = subExpKnownRange e
@@ -236,11 +230,11 @@ expRanges (If _ tbranch fbranch _) =
   (zipWith maximumBound t_upper f_upper)
   where (t_lower, t_upper) = unzip $ rangesOf tbranch
         (f_lower, f_upper) = unzip $ rangesOf fbranch
-expRanges (DoLoop ctxmerge valmerge (ForLoop i Int32 iterations) body) =
+expRanges (DoLoop ctxmerge valmerge (ForLoop i Int32 iterations _) body) =
   zipWith returnedRange valmerge $ rangesOf body
   where bound_in_loop =
           S.fromList $ i : map (paramName . fst) (ctxmerge++valmerge) ++
-          concatMap (patternNames . bindingPattern) (bodyStms body)
+          concatMap (patternNames . stmPattern) (bodyStms body)
 
         returnedRange mergeparam (lower, upper) =
           (returnedBound mergeparam lower,

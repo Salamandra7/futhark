@@ -11,8 +11,9 @@ module Futhark.CodeGen.ImpCode.Sequential
 
 import Futhark.CodeGen.ImpCode hiding (Function, Code)
 import qualified Futhark.CodeGen.ImpCode as Imp
+import Futhark.Representation.AST.Attributes.Names
 
-import Futhark.Util.Pretty hiding (space)
+import Futhark.Util.Pretty
 
 -- | An imperative program.
 type Program = Imp.Functions Sequential
@@ -28,3 +29,6 @@ data Sequential
 
 instance Pretty Sequential where
   ppr _ = empty
+
+instance FreeIn Sequential where
+  freeIn _ = mempty

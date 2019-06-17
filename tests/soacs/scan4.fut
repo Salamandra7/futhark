@@ -9,15 +9,14 @@
 -- }
 
 
-let step(xs: [#n]i32): [n]i32 =
+let step [n] (xs: [n]i32): [n]i32 =
   let bits = map (+1) xs
   let ps1 = scan (+) 0 bits
   let bits_sum = reduce (+) 0 bits
   let ps1' = map (+bits_sum) ps1
-  let xs' = map (+) (ps1') xs
+  let xs' = map2 (+) (ps1') xs
   in xs'
 
-let main(xs: [#n]i32): [n]i32 =
-  loop (xs) = for i < 2 do
+let main [n] (xs: [n]i32): [n]i32 =
+  loop (xs) for i < 2 do
     step(xs)
-  in xs

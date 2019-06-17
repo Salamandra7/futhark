@@ -2,7 +2,6 @@
 -- ==
 -- input { 9 } output { 3 }
 
-import "futlib/math"
 
 module type operation = {type a type b val f: a -> b}
 
@@ -17,13 +16,13 @@ module compose = \(F: operation) ->
 module i32_to_f64: operation with a = i32 with b = f64 = {
   type a = i32
   type b = f64
-  let f(x: a) = f64 x
+  let f(x: a) = r64 x
 }
 
 module f64_to_i32: operation with a = f64 with b = i32 = {
   type a = f64
   type b = i32
-  let f(x: a) = i32 x
+  let f(x: a) = t64 x
 }
 
 module f64_sqrt: operation with a = f64 with b = f64 = {

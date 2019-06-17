@@ -23,10 +23,7 @@ module Futhark.Representation.AST.Attributes.TypeOf
        , bodyExtType
        , primOpType
        , mapType
-       , valueShapeContext
        , subExpShapeContext
-       , loopResultContext
-       , loopExtType
 
        -- * Return type
        , module Futhark.Representation.AST.RetType
@@ -38,23 +35,15 @@ module Futhark.Representation.AST.Attributes.TypeOf
        )
        where
 
-import Control.Applicative
-import Control.Monad.Reader
-import Data.List
 import Data.Maybe
-import Data.Monoid
+import Data.Foldable
 import qualified Data.Set as S
-import Data.Traversable hiding (mapM)
-
-import Prelude hiding (mapM)
 
 import Futhark.Representation.AST.Syntax
 import Futhark.Representation.AST.Attributes.Reshape
 import Futhark.Representation.AST.Attributes.Types
 import Futhark.Representation.AST.Attributes.Patterns
-import Futhark.Representation.AST.Attributes.Values
 import Futhark.Representation.AST.Attributes.Constants
-import Futhark.Representation.AST.Attributes.Names
 import Futhark.Representation.AST.RetType
 import Futhark.Representation.AST.Attributes.Scope
 
@@ -87,54 +76,51 @@ primOpType (UnOp _ x) =
 primOpType CmpOp{} =
   pure [Prim Bool]
 primOpType (ConvOp conv _) =
-  pure [Prim $ snd $ convTypes conv]
-primOpType (Index _ ident slice) =
+  pure [Prim $ snd $ convOpType conv]
+primOpType (Index ident slice) =
   result <$> lookupType ident
   where result t = [Prim (elemType t) `arrayOfShape` shape]
         shape = Shape $ mapMaybe dimSize slice
         dimSize (DimSlice _ d _) = Just d
         dimSize DimFix{}         = Nothing
+primOpType (Update src _ _) =
+  pure <$> lookupType src
 primOpType (Iota n _ _ et) =
   pure [arrayOf (Prim (IntType et)) (Shape [n]) NoUniqueness]
 primOpType (Replicate (Shape []) e) =
   pure <$> subExpType e
+primOpType (Repeat shape innershape v) =
+  pure . repeatDims shape innershape <$> lookupType v
 primOpType (Replicate shape e) =
   pure . flip arrayOfShape shape <$> subExpType e
 primOpType (Scratch t shape) =
   pure [arrayOf (Prim t) (Shape shape) NoUniqueness]
-primOpType (Reshape _ [] e) =
+primOpType (Reshape [] e) =
   result <$> lookupType e
   where result t = [Prim $ elemType t]
-primOpType (Reshape _ shape e) =
+primOpType (Reshape shape e) =
   result <$> lookupType e
   where result t = [t `setArrayShape` newShape shape]
-primOpType (Rearrange _ perm e) =
+primOpType (Rearrange perm e) =
   result <$> lookupType e
   where result t = [rearrangeType perm t]
-primOpType (Rotate _ _ e) =
+primOpType (Rotate _ e) =
   pure <$> lookupType e
-primOpType (Split _ i sizeexps e) =
-  result <$> lookupType e
-  where result t = map (setDimSize i t) sizeexps
-primOpType (Concat _ i x _ ressize) =
+primOpType (Concat i x _ ressize) =
   result <$> lookupType x
   where result xt = [setDimSize i xt ressize]
 primOpType (Copy v) =
   pure <$> lookupType v
 primOpType (Manifest _ v) =
   pure <$> lookupType v
-primOpType (Assert _ _) =
+primOpType Assert{} =
   pure [Prim Cert]
-primOpType (Partition _ n _ arrays) =
-  result <$> traverse lookupType arrays
-  where result ts = replicate n (Prim $ IntType Int32) ++ ts
-
 
 -- | The type of an expression.
 expExtType :: (HasScope lore m, TypedOp (Op lore)) =>
               Exp lore -> m [ExtType]
-expExtType (Apply _ _ rt) = pure $ map fromDecl $ retTypeValues rt
-expExtType (If _ _ _ rt)  = pure rt
+expExtType (Apply _ _ rt _) = pure $ map fromDecl $ retTypeValues rt
+expExtType (If _ _ _ rt)  = pure $ bodyTypeValues $ ifReturns rt
 expExtType (DoLoop ctxmerge valmerge _ _) =
   pure $ loopExtType (map (paramIdent . fst) ctxmerge) (map (paramIdent . fst) valmerge)
 expExtType (BasicOp op)    = staticShapes <$> primOpType op
@@ -159,21 +145,16 @@ instance Annotations lore => HasScope lore (FeelBad lore) where
   lookupType = const $ pure $ Prim $ IntType Int32
   askScope = pure mempty
 
--- | The type of a body.
+-- | The type of a body.  Watch out: this only works for the
+-- degenerate case where the body does not already return its context.
 bodyExtType :: (HasScope lore m, Monad m) =>
                Body lore -> m [ExtType]
-bodyExtType (Body _ bnds res) =
+bodyExtType (Body _ stms res) =
   existentialiseExtTypes bound . staticShapes <$>
   extendedScope (traverse subExpType res) bndscope
-  where bndscope = scopeOf bnds
-        boundInLet (Let pat _ _) = patternNames pat
-        bound = S.fromList $ concatMap boundInLet bnds
-
--- | Given an the return type of a function and the values returned by
--- that function, return the size context.
-valueShapeContext :: [TypeBase ExtShape u] -> [Value] -> [Value]
-valueShapeContext rettype values =
-  map (PrimVal . value) $ extractShapeContext rettype $ map valueShape values
+  where bndscope = scopeOf stms
+        boundInLet (Let pat _ _) = S.fromList $ patternNames pat
+        bound = S.toList $ fold $ fmap boundInLet stms
 
 -- | Given the return type of a function and the subexpressions
 -- returned by that function, return the size context.
@@ -182,21 +163,12 @@ subExpShapeContext :: HasScope t m =>
 subExpShapeContext rettype ses =
   extractShapeContext rettype <$> traverse (fmap arrayDims . subExpType) ses
 
--- | A loop returns not only its value merge parameters, but may also
--- have an existential context.  Thus, @loopResult ctxmergeparams
--- valmergeparams@ returns those paramters in @ctxmergeparams@ that
--- constitute the returned context.
-loopResultContext :: FreeIn attr => [Param attr] -> [Param attr] -> [Param attr]
-loopResultContext ctx val = filter usedInValue ctx
-  where usedInValue = (`S.member` used) . paramName
-        used = freeIn val <> freeIn ctx
-
 -- | Given the context and value merge parameters of a Futhark @loop@,
 -- produce the return type.
 loopExtType :: [Ident] -> [Ident] -> [ExtType]
 loopExtType ctx val =
   existentialiseExtTypes inaccessible $ staticShapes $ map identType val
-  where inaccessible = S.fromList $ map identName ctx
+  where inaccessible = map identName ctx
 
 -- | Any operation must define an instance of this class, which
 -- describes the type of the operation (at the value level).

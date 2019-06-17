@@ -20,7 +20,8 @@ module Futhark.Representation.AST.Attributes.Scope
        , inScopeOf
        , scopeOfLParams
        , scopeOfFParams
-       , scopeOfLoopForm
+       , scopeOfPattern
+       , scopeOfPatElem
 
        , SameScope
        , castScope
@@ -31,21 +32,18 @@ module Futhark.Representation.AST.Attributes.Scope
        , extendedScope
        ) where
 
-import Control.Applicative
+import Control.Monad.Except
 import Control.Monad.Reader
 import qualified Control.Monad.RWS.Strict
 import qualified Control.Monad.RWS.Lazy
-import Data.List
-import Data.Maybe
-import Data.Monoid
+import Data.Foldable
 import qualified Data.Map.Strict as M
-
-import Prelude
 
 import Futhark.Representation.AST.Annotations
 import Futhark.Representation.AST.Syntax
 import Futhark.Representation.AST.Attributes.Types
 import Futhark.Representation.AST.Attributes.Patterns
+import Futhark.Representation.AST.Pretty ()
 
 -- | How some name in scope was bound.
 data NameInfo lore = LetInfo (LetAttr lore)
@@ -98,6 +96,9 @@ instance (Applicative m, Monad m, Annotations lore) =>
          HasScope lore (ReaderT (Scope lore) m) where
   askScope = ask
 
+instance (Monad m, HasScope lore m) => HasScope lore (ExceptT e m) where
+  askScope = lift askScope
+
 instance (Applicative m, Monad m, Monoid w, Annotations lore) =>
          HasScope lore (Control.Monad.RWS.Strict.RWST (Scope lore) w s m) where
   askScope = ask
@@ -114,6 +115,9 @@ class (HasScope lore m, Monad m) => LocalScope lore m where
   -- this is intended to *add* to the current type environment, it
   -- does not replace it.
   localScope :: Scope lore -> m a -> m a
+
+instance (Monad m, LocalScope lore m) => LocalScope lore (ExceptT e m) where
+  localScope = mapExceptT . localScope
 
 instance (Applicative m, Monad m, Annotations lore) =>
          LocalScope lore (ReaderT (Scope lore) m) where
@@ -137,21 +141,14 @@ class Scoped lore a | a -> lore where
 inScopeOf :: (Scoped lore a, LocalScope lore m) => a -> m b -> m b
 inScopeOf = localScope . scopeOf
 
-instance LetAttr lore ~ attr =>
-         Scoped lore (PatElemT attr) where
-  scopeOf (PatElem name _ attr) =
-    M.singleton name $ LetInfo attr
-
-instance LetAttr lore ~ attr =>
-         Scoped lore (PatternT attr) where
-  scopeOf = mconcat . map scopeOf . patternElements
-
-instance Scoped lore a =>
-         Scoped lore [a] where
+instance Scoped lore a => Scoped lore [a] where
   scopeOf = mconcat . map scopeOf
 
+instance Scoped lore (Stms lore) where
+  scopeOf = fold . fmap scopeOf
+
 instance Scoped lore (Stm lore) where
-  scopeOf = scopeOf . bindingPattern
+  scopeOf = scopeOfPattern . stmPattern
 
 instance Scoped lore (FunDef lore) where
   scopeOf = scopeOfFParams . funDefParams
@@ -159,9 +156,17 @@ instance Scoped lore (FunDef lore) where
 instance Scoped lore (VName, NameInfo lore) where
   scopeOf = uncurry M.singleton
 
-scopeOfLoopForm :: LoopForm -> Scope lore
-scopeOfLoopForm (WhileLoop _) = mempty
-scopeOfLoopForm (ForLoop i it _) = M.singleton i (IndexInfo it)
+instance Scoped lore (LoopForm lore) where
+  scopeOf (WhileLoop _) = mempty
+  scopeOf (ForLoop i it _ xs) =
+    M.insert i (IndexInfo it) $ scopeOfLParams (map fst xs)
+
+scopeOfPattern :: LetAttr lore ~ attr => PatternT attr -> Scope lore
+scopeOfPattern =
+  mconcat . map scopeOfPatElem . patternElements
+
+scopeOfPatElem :: LetAttr lore ~ attr => PatElemT attr -> Scope lore
+scopeOfPatElem (PatElem name attr) = M.singleton name $ LetInfo attr
 
 scopeOfLParams :: LParamAttr lore ~ attr =>
                   [ParamT attr] -> Scope lore
@@ -175,9 +180,6 @@ scopeOfFParams = M.fromList . map f
 
 instance Scoped lore (Lambda lore) where
   scopeOf lam = scopeOfLParams $ lambdaParams lam
-
-instance Scoped lore (ExtLambda lore) where
-  scopeOf lam = scopeOfLParams $ extLambdaParams lam
 
 type SameScope lore1 lore2 = (LetAttr lore1 ~ LetAttr lore2,
                               FParamAttr lore1 ~ FParamAttr lore2,
@@ -208,7 +210,7 @@ instance (HasScope lore m, Monad m) =>
   lookupType name = do
     res <- asks $ fmap typeOf . M.lookup name
     maybe (ExtendedScope $ lift $ lookupType name) return res
-  askScope = M.union <$> ask <*> ExtendedScope (lift askScope)
+  askScope = asks M.union <*> ExtendedScope (lift askScope)
 
 -- | Run a computation in the extended type environment.
 extendedScope :: ExtendedScope lore m a

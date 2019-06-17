@@ -1,4 +1,5 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
 -- | The most primitive ("core") aspects of the AST.  Split out of
 -- "Futhark.Representation.AST.Syntax" in order for
 -- "Futhark.Representation.AST.Annotations" to use these definitions.  This
@@ -12,9 +13,11 @@ module Futhark.Representation.AST.Syntax.Core
          -- * Types
          , Uniqueness(..)
          , NoUniqueness(..)
-         , Shape(..)
-         , ExtDimSize(..)
-         , ExtShape(..)
+         , ShapeBase(..)
+         , Shape
+         , Ext(..)
+         , ExtSize
+         , ExtShape
          , Rank(..)
          , ArrayShape(..)
          , Space (..)
@@ -25,60 +28,62 @@ module Futhark.Representation.AST.Syntax.Core
          , DeclType
          , DeclExtType
          , Diet(..)
+         , ErrorMsg (..)
+         , ErrorMsgPart (..)
 
          -- * Values
          , PrimValue(..)
-         , Value(..)
 
          -- * Abstract syntax tree
          , Ident (..)
-         , Certificates
+         , Certificates(..)
          , SubExp(..)
          , ParamT (..)
          , Param
-         , Bindage (..)
          , DimIndex (..)
          , Slice
          , dimFix
          , sliceIndices
          , sliceDims
          , unitSlice
+         , fixSlice
          , PatElemT (..)
 
          -- * Miscellaneous
          , Names
          ) where
 
-import Control.Applicative
 import Control.Monad.State
-import Data.Array
-import Data.Foldable hiding (and)
-import Data.Traversable hiding (mapM)
-import Data.Hashable
 import Data.Maybe
-import Data.Monoid
+import Data.Monoid ((<>))
+import Data.String
 import qualified Data.Set as S
 import qualified Data.Map.Strict as M
-
-import Prelude
+import Data.Traversable
 
 import Language.Futhark.Core
 import Futhark.Representation.Primitive
 
--- | The size of an array type as a list of its dimension sizes.  If a
--- variable, that variable must be in scope where this array is used.
-newtype Shape = Shape { shapeDims :: [SubExp] }
-              deriving (Eq, Ord, Show)
+-- | The size of an array type as a list of its dimension sizes, with
+-- the type of sizes being parametric.
+newtype ShapeBase d = Shape { shapeDims :: [d] }
+                    deriving (Eq, Ord, Show)
+
+-- | The size of an array as a list of subexpressions.  If a variable,
+-- that variable must be in scope where this array is used.
+type Shape = ShapeBase SubExp
+
+-- | Something that may be existential.
+data Ext a = Ext Int
+           | Free a
+           deriving (Eq, Ord, Show)
 
 -- | The size of this dimension.
-data ExtDimSize = Free SubExp -- ^ Some known dimension.
-                | Ext Int -- ^ Existentially quantified.
-                  deriving (Eq, Ord, Show)
+type ExtSize = Ext SubExp
 
 -- | Like 'Shape' but some of its elements may be bound in a local
 -- environment instead.  These are denoted with integral indices.
-newtype ExtShape = ExtShape { extShapeDims :: [ExtDimSize] }
-                 deriving (Eq, Ord, Show)
+type ExtShape = ShapeBase ExtSize
 
 -- | The size of an array type as merely the number of dimensions,
 -- with no further information.
@@ -95,23 +100,24 @@ class (Monoid a, Eq a, Ord a) => ArrayShape a where
   -- | Check whether one shape if a subset of another shape.
   subShapeOf :: a -> a -> Bool
 
-instance Monoid Shape where
-  mempty = Shape mempty
-  Shape l1 `mappend` Shape l2 = Shape $ l1 `mappend` l2
+instance Semigroup (ShapeBase d) where
+  Shape l1 <> Shape l2 = Shape $ l1 `mappend` l2
 
-instance ArrayShape Shape where
+instance Monoid (ShapeBase d) where
+  mempty = Shape mempty
+
+instance Functor ShapeBase where
+  fmap f = Shape . map f . shapeDims
+
+instance ArrayShape (ShapeBase SubExp) where
   shapeRank (Shape l) = length l
   stripDims n (Shape dims) = Shape $ drop n dims
   subShapeOf = (==)
 
-instance Monoid ExtShape where
-  mempty = ExtShape mempty
-  ExtShape l1 `mappend` ExtShape l2 = ExtShape $ l1 `mappend` l2
-
-instance ArrayShape ExtShape where
-  shapeRank (ExtShape l) = length l
-  stripDims n (ExtShape dims) = ExtShape $ drop n dims
-  subShapeOf (ExtShape ds1) (ExtShape ds2) =
+instance ArrayShape (ShapeBase ExtSize) where
+  shapeRank (Shape l) = length l
+  stripDims n (Shape dims) = Shape $ drop n dims
+  subShapeOf (Shape ds1) (Shape ds2) =
     -- Must agree on Free dimensions, and ds1 may not be existential
     -- where ds2 is Free.  Existentials must also be congruent.
     length ds1 == length ds2 &&
@@ -127,9 +133,11 @@ instance ArrayShape ExtShape where
               Nothing -> do put $ M.insert y x extmap
                             return True
 
+instance Semigroup Rank where
+  Rank x <> Rank y = Rank $ x + y
+
 instance Monoid Rank where
   mempty = Rank 0
-  Rank x `mappend` Rank y = Rank $ x + y
 
 instance ArrayShape Rank where
   shapeRank (Rank x) = x
@@ -157,7 +165,7 @@ data NoUniqueness = NoUniqueness
 -- comparing types for equality with '==', shapes must match.
 data TypeBase shape u = Prim PrimType
                       | Array PrimType shape u
-                      | Mem SubExp Space
+                      | Mem Space
                     deriving (Show, Eq, Ord)
 
 -- | A type with shape information, used for describing the type of
@@ -183,15 +191,11 @@ type DeclExtType = TypeBase ExtShape Uniqueness
 -- Observe]@.
 data Diet = Consume -- ^ Consumes this value.
           | Observe -- ^ Only observes value in this position, does
-                    -- not consume.
+                    -- not consume.  A result may alias this.
+          | ObservePrim -- ^ As 'Observe', but the result will not
+                        -- alias, because the parameter does not carry
+                        -- aliases.
             deriving (Eq, Ord, Show)
-
--- | Every possible value in Futhark.  Values are fully evaluated and their
--- type is always unambiguous.
-data Value = PrimVal !PrimValue
-           | ArrayVal !(Array Int PrimValue) PrimType [Int]
-             -- ^ It is assumed that the array is 0-indexed.
-             deriving (Eq, Ord, Show)
 
 -- | An identifier consists of its name and the type of the value
 -- bound to the identifier.
@@ -206,11 +210,15 @@ instance Eq Ident where
 instance Ord Ident where
   x `compare` y = identName x `compare` identName y
 
-instance Hashable Ident where
-  hashWithSalt salt = hashWithSalt salt . identName
-
 -- | A list of names used for certificates in some expressions.
-type Certificates = [VName]
+newtype Certificates = Certificates { unCertificates :: [VName] }
+                     deriving (Eq, Ord, Show)
+
+instance Semigroup Certificates where
+  Certificates x <> Certificates y = Certificates (x <> y)
+
+instance Monoid Certificates where
+  mempty = Certificates mempty
 
 -- | A subexpression is either a scalar constant or a variable.  One
 -- important property is that evaluation of a subexpression is
@@ -231,9 +239,14 @@ data ParamT attr = Param
 -- | A type alias for namespace control.
 type Param = ParamT
 
-instance Functor ParamT where
-  fmap f (Param name attr) = Param name (f attr)
+instance Foldable ParamT where
+  foldMap = foldMapDefault
 
+instance Functor ParamT where
+  fmap = fmapDefault
+
+instance Traversable ParamT where
+  traverse f (Param name attr) = Param name <$> f attr
 
 -- | How to index a single dimension of an array.
 data DimIndex d = DimFix
@@ -279,34 +292,65 @@ sliceDims = mapMaybe dimSlice
 unitSlice :: Num d => d -> d -> DimIndex d
 unitSlice offset n = DimSlice offset n 1
 
--- | How a name in a let-binding is bound - either as a plain
--- variable, or in the form of an in-place update.
-data Bindage = BindVar -- ^ Bind as normal.
-             | BindInPlace Certificates VName (Slice SubExp)
-               -- ^ Perform an in-place update, in which the value
-               -- being bound is inserted at the given index in the
-               -- array referenced by the 'VName'.  Note that the
-               -- result of the binding is the entire array, not just
-               -- the value that has been inserted..  The
-               -- 'Certificates' contain bounds checking certificates
-               -- (if necessary).
-                  deriving (Ord, Show, Eq)
+-- | Fix the 'DimSlice's of a slice.  The number of indexes must equal
+-- the length of 'sliceDims' for the slice.
+fixSlice :: Num d => Slice d -> [d] -> [d]
+fixSlice (DimFix j:mis') is' =
+  j : fixSlice mis' is'
+fixSlice (DimSlice orig_k _ orig_s:mis') (i:is') =
+  (orig_k+i*orig_s) : fixSlice mis' is'
+fixSlice _ _ = []
 
--- | An element of a pattern - consisting of an name (essentially a
--- pair of the name andtype), a 'Bindage', and an addditional
--- parametric attribute.  This attribute is what is expected to
--- contain the type of the resulting variable.
+-- | An element of a pattern - consisting of a name (essentially a
+-- pair of the name and type) and an addditional parametric attribute.
+-- This attribute is what is expected to contain the type of the
+-- resulting variable.
 data PatElemT attr = PatElem { patElemName :: VName
                                -- ^ The name being bound.
-                             , patElemBindage :: Bindage
-                               -- ^ How the name is bound.
                              , patElemAttr :: attr
                                -- ^ Pattern element attribute.
                              }
                    deriving (Ord, Show, Eq)
 
 instance Functor PatElemT where
-  fmap f (PatElem name bindage attr) = PatElem name bindage (f attr)
+  fmap f (PatElem name attr) = PatElem name (f attr)
 
 -- | A set of names.
 type Names = S.Set VName
+
+-- | An error message is a list of error parts, which are concatenated
+-- to form the final message.
+newtype ErrorMsg a = ErrorMsg [ErrorMsgPart a]
+  deriving (Eq, Ord, Show)
+
+instance IsString (ErrorMsg a) where
+  fromString = ErrorMsg . pure . fromString
+
+-- | A part of an error message.
+data ErrorMsgPart a = ErrorString String -- ^ A literal string.
+                    | ErrorInt32 a -- ^ A run-time integer value.
+                    deriving (Eq, Ord, Show)
+
+instance IsString (ErrorMsgPart a) where
+  fromString = ErrorString
+
+instance Functor ErrorMsg where
+  fmap f (ErrorMsg parts) = ErrorMsg $ map (fmap f) parts
+
+instance Foldable ErrorMsg where
+  foldMap f (ErrorMsg parts) = foldMap (foldMap f) parts
+
+instance Traversable ErrorMsg where
+  traverse f (ErrorMsg parts) = ErrorMsg <$> traverse (traverse f) parts
+
+instance Functor ErrorMsgPart where
+  fmap _ (ErrorString s) = ErrorString s
+  fmap f (ErrorInt32 a) = ErrorInt32 $ f a
+
+instance Foldable ErrorMsgPart where
+  foldMap _ ErrorString{} = mempty
+  foldMap f (ErrorInt32 a) = f a
+
+instance Traversable ErrorMsgPart where
+  traverse _ (ErrorString s) = pure $ ErrorString s
+  traverse f (ErrorInt32 a) = ErrorInt32 <$> f a

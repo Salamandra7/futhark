@@ -3,6 +3,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 -- | A representation where all bindings are annotated with range
 -- information.
 module Futhark.Representation.Ranges
@@ -27,18 +28,15 @@ module Futhark.Representation.Ranges
        , removeBodyRanges
        , removeStmRanges
        , removeLambdaRanges
-       , removeExtLambdaRanges
        , removePatternRanges
        )
 where
 
 import Control.Monad.Identity
+import Control.Monad.Reader
 import qualified Data.Set as S
-import Data.Hashable
-import Data.Maybe
-import Data.Monoid
-
-import Prelude
+import Data.Monoid ((<>))
+import Data.Foldable
 
 import Futhark.Representation.AST.Syntax
 import Futhark.Representation.AST.Attributes
@@ -59,10 +57,25 @@ instance (Annotations lore, CanBeRanged (Op lore)) =>
   type FParamAttr (Ranges lore) = FParamAttr lore
   type LParamAttr (Ranges lore) = LParamAttr lore
   type RetType (Ranges lore) = RetType lore
+  type BranchType (Ranges lore) = BranchType lore
   type Op (Ranges lore) = OpWithRanges (Op lore)
+
+withoutRanges :: (HasScope (Ranges lore) m, Monad m) =>
+                 ReaderT (Scope lore) m a ->
+                 m a
+withoutRanges m = do
+  scope <- asksScope $ fmap unRange
+  runReaderT m scope
+    where unRange :: NameInfo (Ranges lore) -> NameInfo lore
+          unRange (LetInfo (_, x)) = LetInfo x
+          unRange (FParamInfo x) = FParamInfo x
+          unRange (LParamInfo x) = LParamInfo x
+          unRange (IndexInfo x) = IndexInfo x
 
 instance (Attributes lore, CanBeRanged (Op lore)) =>
          Attributes (Ranges lore) where
+  expTypesFromPattern =
+    withoutRanges . expTypesFromPattern . removePatternRanges
 
 instance RangeOf (Range, attr) where
   rangeOf = fst
@@ -95,6 +108,7 @@ removeRanges = Rephraser { rephraseExpLore = return
                          , rephraseFParamLore = return
                          , rephraseLParamLore = return
                          , rephraseRetType = return
+                         , rephraseBranchType = return
                          , rephraseOp = return . removeOpRanges
                          }
 
@@ -122,10 +136,6 @@ removeLambdaRanges :: CanBeRanged (Op lore) =>
                       Lambda (Ranges lore) -> Lambda lore
 removeLambdaRanges = runIdentity . rephraseLambda removeRanges
 
-removeExtLambdaRanges :: CanBeRanged (Op lore) =>
-                         ExtLambda (Ranges lore) -> ExtLambda lore
-removeExtLambdaRanges = runIdentity . rephraseExtLambda removeRanges
-
 removePatternRanges :: PatternT (Range, a)
                     -> PatternT a
 removePatternRanges = runIdentity . rephrasePattern (return . snd)
@@ -136,7 +146,7 @@ addRangesToPattern :: (Attributes lore, CanBeRanged (Op lore)) =>
 addRangesToPattern pat e =
   uncurry Pattern $ mkPatternRanges pat e
 
-mkRangedBody :: BodyAttr lore -> [Stm (Ranges lore)] -> Result
+mkRangedBody :: BodyAttr lore -> Stms (Ranges lore) -> Result
              -> Body (Ranges lore)
 mkRangedBody innerlore bnds res =
   Body (mkBodyRanges bnds res, innerlore) bnds res
@@ -154,10 +164,10 @@ mkPatternRanges pat e =
           in patElem `setPatElemLore` (range, innerlore)
         ranges = expRanges e
 
-mkBodyRanges :: [Stm lore] -> Result -> [Range]
+mkBodyRanges :: Stms lore -> Result -> [Range]
 mkBodyRanges bnds = map $ removeUnknownBounds . rangeOf
   where boundInBnds =
-          mconcat $ map (S.fromList . patternNames . bindingPattern) bnds
+          fold $ fmap (S.fromList . patternNames . stmPattern) bnds
         removeUnknownBounds (lower,upper) =
           (removeUnknownBound lower,
            removeUnknownBound upper)
@@ -167,7 +177,7 @@ mkBodyRanges bnds = map $ removeUnknownBounds . rangeOf
         removeUnknownBound Nothing =
           Nothing
 
-intersects :: (Ord a, Hashable a) => S.Set a -> S.Set a -> Bool
+intersects :: Ord a => S.Set a -> S.Set a -> Bool
 intersects a b = not $ S.null $ a `S.intersection` b
 
 mkRangedLetStm :: (Attributes lore, CanBeRanged (Op lore)) =>
@@ -176,4 +186,4 @@ mkRangedLetStm :: (Attributes lore, CanBeRanged (Op lore)) =>
                -> Exp (Ranges lore)
                -> Stm (Ranges lore)
 mkRangedLetStm pat explore e =
-  Let (addRangesToPattern pat e) explore e
+  Let (addRangesToPattern pat e) (StmAux mempty explore) e

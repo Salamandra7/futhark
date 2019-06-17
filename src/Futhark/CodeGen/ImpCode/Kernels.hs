@@ -11,26 +11,24 @@ module Futhark.CodeGen.ImpCode.Kernels
   , KernelConstExp
   , HostOp (..)
   , KernelOp (..)
-  , CallKernel (..)
-  , MapKernel (..)
+  , AtomicOp (..)
   , Kernel (..)
   , LocalMemoryUse
   , KernelUse (..)
   , module Futhark.CodeGen.ImpCode
+  , module Futhark.Representation.Kernels.Sizes
   -- * Utility functions
   , getKernels
+  , atomicBinOp
   )
   where
 
 import Control.Monad.Writer
 import Data.List
-import qualified Data.Set as S
-import Data.Traversable
-
-import Prelude
 
 import Futhark.CodeGen.ImpCode hiding (Function, Code)
 import qualified Futhark.CodeGen.ImpCode as Imp
+import Futhark.Representation.Kernels.Sizes
 import Futhark.Representation.AST.Attributes.Names
 import Futhark.Representation.AST.Pretty ()
 import Futhark.Util.Pretty
@@ -38,149 +36,110 @@ import Futhark.Util.Pretty
 type Program = Functions HostOp
 type Function = Imp.Function HostOp
 -- | Host-level code that can call kernels.
-type Code = Imp.Code CallKernel
+type Code = Imp.Code HostOp
 -- | Code inside a kernel.
 type KernelCode = Imp.Code KernelOp
 
 -- | A run-time constant related to kernels.
-data KernelConst = GroupSizeConst
-                 | NumGroupsConst
-                 | TileSizeConst
-                 deriving (Eq, Ord, Show)
+newtype KernelConst = SizeConst Name
+                    deriving (Eq, Ord, Show)
 
 -- | An expression whose variables are kernel constants.
 type KernelConstExp = PrimExp KernelConst
 
-data HostOp = CallKernel CallKernel
-            | GetNumGroups VName
-            | GetGroupSize VName
-            | GetTileSize VName
-            deriving (Show)
-
-data CallKernel = Map MapKernel
-                | AnyKernel Kernel
-                | MapTranspose PrimType VName Exp VName Exp Exp Exp Exp Exp Exp
+data HostOp = CallKernel Kernel
+            | GetSize VName Name SizeClass
+            | CmpSizeLe VName Name SizeClass Imp.Exp
+            | GetSizeMax VName SizeClass
             deriving (Show)
 
 -- | A generic kernel containing arbitrary kernel code.
-data MapKernel = MapKernel { mapKernelThreadNum :: VName
-                             -- ^ Stm position - also serves as a unique
-                             -- name for the kernel.
-                           , mapKernelDesc :: String
-                           -- ^ Used to name the kernel for readability.
-                           , mapKernelBody :: Imp.Code KernelOp
-                           , mapKernelUses :: [KernelUse]
-                           , mapKernelNumGroups :: DimSize
-                           , mapKernelGroupSize :: DimSize
-                           , mapKernelSize :: Imp.Exp
-                           -- ^ Do not actually execute threads past this.
-                           }
-                     deriving (Show)
-
 data Kernel = Kernel
               { kernelBody :: Imp.Code KernelOp
-              , kernelLocalMemory :: [LocalMemoryUse]
-              -- ^ The local memory used by this kernel.
 
               , kernelUses :: [KernelUse]
                 -- ^ The host variables referenced by the kernel.
 
-              , kernelNumGroups :: DimSize
-              , kernelGroupSize :: DimSize
-              , kernelName :: VName
-                -- ^ Unique name for the kernel.
-              , kernelDesc :: String
-               -- ^ A short descriptive name - should be
+              , kernelNumGroups :: [Imp.Exp]
+              , kernelGroupSize :: [Imp.Exp]
+              , kernelName :: Name
+               -- ^ A short descriptive and _unique_ name - should be
                -- alphanumeric and without spaces.
               }
             deriving (Show)
 
 -- ^ In-kernel name and per-workgroup size in bytes.
-type LocalMemoryUse = (VName, Either MemSize KernelConstExp)
+type LocalMemoryUse = (VName, Either (Count Bytes) KernelConstExp)
 
 data KernelUse = ScalarUse VName PrimType
-               | MemoryUse VName Imp.DimSize
+               | MemoryUse VName
                | ConstUse VName KernelConstExp
                  deriving (Eq, Show)
 
-getKernels :: Program -> [CallKernel]
+getKernels :: Program -> [Kernel]
 getKernels = nubBy sameKernel . execWriter . traverse getFunKernels
   where getFunKernels (CallKernel kernel) =
           tell [kernel]
         getFunKernels _ =
           return ()
-        sameKernel (MapTranspose bt1 _ _ _ _ _ _ _ _ _) (MapTranspose bt2 _ _ _ _ _ _ _ _ _) =
-          bt1 == bt2
         sameKernel _ _ = False
 
+-- | Get an atomic operator corresponding to a binary operator.
+atomicBinOp :: BinOp -> Maybe (VName -> VName -> Count Elements -> Exp -> AtomicOp)
+atomicBinOp = flip lookup [ (Add Int32, AtomicAdd)
+                          , (SMax Int32, AtomicSMax)
+                          , (SMin Int32, AtomicSMin)
+                          , (UMax Int32, AtomicUMax)
+                          , (UMin Int32, AtomicUMin)
+                          , (And Int32, AtomicAnd)
+                          , (Or Int32, AtomicOr)
+                          , (Xor Int32, AtomicXor)
+                          ]
+
 instance Pretty KernelConst where
-  ppr NumGroupsConst = text "$num_groups()"
-  ppr GroupSizeConst = text "$group_size()"
-  ppr TileSizeConst = text "$tile_size()"
+  ppr (SizeConst key) = text "get_size" <> parens (ppr key)
 
 instance Pretty KernelUse where
   ppr (ScalarUse name t) =
-    text "scalar_copy" <> parens (commasep [ppr name, ppr t])
-  ppr (MemoryUse name size) =
-    text "mem_copy" <> parens (commasep [ppr name, ppr size])
+    oneLine $ text "scalar_copy" <> parens (commasep [ppr name, ppr t])
+  ppr (MemoryUse name) =
+    oneLine $ text "mem_copy" <> parens (commasep [ppr name])
   ppr (ConstUse name e) =
-    text "const" <> parens (commasep [ppr name, ppr e])
+    oneLine $ text "const" <> parens (commasep [ppr name, ppr e])
 
 instance Pretty HostOp where
-  ppr (GetNumGroups dest) =
+  ppr (GetSize dest key size_class) =
     ppr dest <+> text "<-" <+>
-    text "get_num_groups()"
-  ppr (GetGroupSize dest) =
+    text "get_size" <> parens (commasep [ppr key, ppr size_class])
+  ppr (GetSizeMax dest size_class) =
+    ppr dest <+> text "<-" <+> text "get_size_max" <> parens (ppr size_class)
+  ppr (CmpSizeLe dest name size_class x) =
     ppr dest <+> text "<-" <+>
-    text "get_group_size()"
-  ppr (GetTileSize dest) =
-    ppr dest <+> text "<-" <+>
-    text "get_tile_size()"
+    text "get_size" <> parens (commasep [ppr name, ppr size_class]) <+>
+    text "<" <+> ppr x
   ppr (CallKernel c) =
     ppr c
 
-instance Pretty CallKernel where
-  ppr (Map k) = ppr k
-  ppr (AnyKernel k) = ppr k
-  ppr (MapTranspose bt dest destoffset src srcoffset num_arrays size_x size_y in_size out_size) =
-    text "mapTranspose" <>
-    parens (ppr bt <> comma </>
-            ppMemLoc dest destoffset <> comma </>
-            ppMemLoc src srcoffset <> comma </>
-            ppr num_arrays <> comma <+>
-            ppr size_x <> comma <+>
-            ppr size_y <> comma <+>
-            ppr in_size <> comma <+>
-            ppr out_size)
-    where ppMemLoc base offset =
-            ppr base <+> text "+" <+> ppr offset
+instance FreeIn HostOp where
+  freeIn (CallKernel c) = freeIn c
+  freeIn (CmpSizeLe dest _ _ x) =
+    freeIn dest <> freeIn x
+  freeIn (GetSizeMax dest _) =
+    freeIn dest
+  freeIn (GetSize dest _ _) =
+    freeIn dest
 
-instance Pretty MapKernel where
-  ppr kernel =
-    text "mapKernel" <+> brace
-    (text "uses" <+> brace (commasep $ map ppr $ mapKernelUses kernel) </>
-     text "body" <+> brace (ppr (mapKernelThreadNum kernel) <+>
-                            text "<- get_thread_number()" </>
-                            ppr (mapKernelBody kernel)))
+instance FreeIn Kernel where
+  freeIn kernel = freeIn (kernelBody kernel) <>
+                  freeIn [kernelNumGroups kernel, kernelGroupSize kernel]
 
 instance Pretty Kernel where
   ppr kernel =
     text "kernel" <+> brace
     (text "groups" <+> brace (ppr $ kernelNumGroups kernel) </>
      text "group_size" <+> brace (ppr $ kernelGroupSize kernel) </>
-     text "local_memory" <+> brace (commasep $
-                                    map ppLocalMemory $
-                                    kernelLocalMemory kernel) </>
      text "uses" <+> brace (commasep $ map ppr $ kernelUses kernel) </>
      text "body" <+> brace (ppr $ kernelBody kernel))
-    where ppLocalMemory (name, Left size) =
-            ppr name <+> parens (ppr size <+> text "bytes")
-          ppLocalMemory (name, Right size) =
-            ppr name <+> parens (ppr size <+> text "bytes (const)")
-
-instance FreeIn MapKernel where
-  freeIn kernel =
-    mapKernelThreadNum kernel `S.delete` freeIn (mapKernelBody kernel)
 
 data KernelOp = GetGroupId VName Int
               | GetLocalId VName Int
@@ -188,8 +147,40 @@ data KernelOp = GetGroupId VName Int
               | GetGlobalSize VName Int
               | GetGlobalId VName Int
               | GetLockstepWidth VName
-              | Barrier
+              | Atomic Space AtomicOp
+              | LocalBarrier
+              | GlobalBarrier
+              | MemFenceLocal
+              | MemFenceGlobal
+              | PrivateAlloc VName (Count Bytes)
+              | LocalAlloc VName (Either (Count Bytes) KernelConstExp)
               deriving (Show)
+
+-- Atomic operations return the value stored before the update.
+-- This value is stored in the first VName.
+data AtomicOp = AtomicAdd VName VName (Count Elements) Exp
+              | AtomicSMax VName VName (Count Elements) Exp
+              | AtomicSMin VName VName (Count Elements) Exp
+              | AtomicUMax VName VName (Count Elements) Exp
+              | AtomicUMin VName VName (Count Elements) Exp
+              | AtomicAnd VName VName (Count Elements) Exp
+              | AtomicOr VName VName (Count Elements) Exp
+              | AtomicXor VName VName (Count Elements) Exp
+              | AtomicCmpXchg VName VName (Count Elements) Exp Exp
+              | AtomicXchg VName VName (Count Elements) Exp
+              deriving (Show)
+
+instance FreeIn AtomicOp where
+  freeIn (AtomicAdd _ arr i x) = freeIn arr <> freeIn i <> freeIn x
+  freeIn (AtomicSMax _ arr i x) = freeIn arr <> freeIn i <> freeIn x
+  freeIn (AtomicSMin _ arr i x) = freeIn arr <> freeIn i <> freeIn x
+  freeIn (AtomicUMax _ arr i x) = freeIn arr <> freeIn i <> freeIn x
+  freeIn (AtomicUMin _ arr i x) = freeIn arr <> freeIn i <> freeIn x
+  freeIn (AtomicAnd _ arr i x) = freeIn arr <> freeIn i <> freeIn x
+  freeIn (AtomicOr _ arr i x) = freeIn arr <> freeIn i <> freeIn x
+  freeIn (AtomicXor _ arr i x) = freeIn arr <> freeIn i <> freeIn x
+  freeIn (AtomicCmpXchg _ arr i x y) = freeIn arr <> freeIn i <> freeIn x <> freeIn y
+  freeIn (AtomicXchg _ arr i x) = freeIn arr <> freeIn i <> freeIn x
 
 instance Pretty KernelOp where
   ppr (GetGroupId dest i) =
@@ -210,11 +201,54 @@ instance Pretty KernelOp where
   ppr (GetLockstepWidth dest) =
     ppr dest <+> text "<-" <+>
     text "get_lockstep_width()"
-  ppr Barrier =
-    text "barrier()"
+  ppr LocalBarrier =
+    text "local_barrier()"
+  ppr GlobalBarrier =
+    text "global_barrier()"
+  ppr MemFenceLocal =
+    text "mem_fence_local()"
+  ppr MemFenceGlobal =
+    text "mem_fence_global()"
+  ppr (PrivateAlloc name size) =
+    ppr name <+> equals <+> text "private_alloc" <> parens (ppr size)
+  ppr (LocalAlloc name size) =
+    ppr name <+> equals <+> text "local_alloc" <>
+    parens (either ppr constCase size)
+    where constCase e = text "(constant)" <+> ppr e
+  ppr (Atomic _ (AtomicAdd old arr ind x)) =
+    ppr old <+> text "<-" <+> text "atomic_add" <>
+    parens (commasep [ppr arr <> brackets (ppr ind), ppr x])
+  ppr (Atomic _ (AtomicSMax old arr ind x)) =
+    ppr old <+> text "<-" <+> text "atomic_smax" <>
+    parens (commasep [ppr arr <> brackets (ppr ind), ppr x])
+  ppr (Atomic _ (AtomicSMin old arr ind x)) =
+    ppr old <+> text "<-" <+> text "atomic_smin" <>
+    parens (commasep [ppr arr <> brackets (ppr ind), ppr x])
+  ppr (Atomic _ (AtomicUMax old arr ind x)) =
+    ppr old <+> text "<-" <+> text "atomic_umax" <>
+    parens (commasep [ppr arr <> brackets (ppr ind), ppr x])
+  ppr (Atomic _ (AtomicUMin old arr ind x)) =
+    ppr old <+> text "<-" <+> text "atomic_umin" <>
+    parens (commasep [ppr arr <> brackets (ppr ind), ppr x])
+  ppr (Atomic _ (AtomicAnd old arr ind x)) =
+    ppr old <+> text "<-" <+> text "atomic_and" <>
+    parens (commasep [ppr arr <> brackets (ppr ind), ppr x])
+  ppr (Atomic _ (AtomicOr old arr ind x)) =
+    ppr old <+> text "<-" <+> text "atomic_or" <>
+    parens (commasep [ppr arr <> brackets (ppr ind), ppr x])
+  ppr (Atomic _ (AtomicXor old arr ind x)) =
+    ppr old <+> text "<-" <+> text "atomic_xor" <>
+    parens (commasep [ppr arr <> brackets (ppr ind), ppr x])
+  ppr (Atomic _ (AtomicCmpXchg old arr ind x y)) =
+    ppr old <+> text "<-" <+> text "atomic_cmp_xchg" <>
+    parens (commasep [ppr arr <> brackets (ppr ind), ppr x, ppr y])
+  ppr (Atomic _ (AtomicXchg old arr ind x)) =
+    ppr old <+> text "<-" <+> text "atomic_xchg" <>
+    parens (commasep [ppr arr <> brackets (ppr ind), ppr x])
 
 instance FreeIn KernelOp where
-  freeIn = const mempty
+  freeIn (Atomic _ op) = freeIn op
+  freeIn _ = mempty
 
 brace :: Doc -> Doc
 brace body = text " {" </> indent 2 body </> text "}"

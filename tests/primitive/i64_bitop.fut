@@ -47,19 +47,11 @@
 -- input { 4  2i64  1i64 } output {  1i64 }
 -- input { 4 -1i64  0i64 } output { -1i64 }
 -- input { 4 -1i64  1i64 } output { -1i64 }
---
--- input { 5  0i64  0i64 } output {  0i64 }
--- input { 5  0i64  1i64 } output {  0i64 }
--- input { 5  1i64  0i64 } output {  1i64 }
--- input { 5  1i64  1i64 } output {  0i64 }
--- input { 5  2i64  1i64 } output {  1i64 }
--- input { 5 -1i64  0i64 } output { -1i64 }
--- input { 5 -1i64  1i64 } output { 9223372036854775807i64 }
 
-let main(f: i32, x: i64, y: i64): i64 =
+let main (f: i32) (x: i64) (y: i64): i64 =
   if      f == 0 then x & y
   else if f == 1 then x | y
   else if f == 2 then x ^ y
   else if f == 3 then x << y
   else if f == 4 then x >> y
-  else                x >>> y
+  else                0

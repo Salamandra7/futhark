@@ -13,26 +13,31 @@ module Futhark.Construct
 
   , eSubExp
   , eIf
+  , eIf'
   , eBinOp
   , eCmpOp
+  , eConvOp
   , eNegate
   , eNot
   , eAbs
   , eSignum
   , eCopy
   , eAssert
-  , eValue
   , eBody
   , eLambda
   , eDivRoundingUp
   , eRoundToMultipleOf
+  , eSliceArray
+  , eSplitArray
+
+  , eOutOfBounds
+  , eWriteArray
 
   , asIntZ, asIntS
 
   , resultBody
   , resultBodyM
   , insertStmsM
-  , mapResultM
   , mapResult
 
   , foldBinOp
@@ -40,6 +45,8 @@ module Futhark.Construct
   , cmpOpLambda
   , fullSlice
   , fullSliceNum
+  , isFullSlice
+  , ifCommon
 
   , module Futhark.Binder
 
@@ -58,16 +65,12 @@ module Futhark.Construct
   )
 where
 
-import qualified Data.Array as A
 import qualified Data.Map.Strict as M
 import Data.Loc (SrcLoc)
-
-import Control.Applicative
+import Data.List
 import Control.Monad.Identity
 import Control.Monad.State
 import Control.Monad.Writer
-
-import Prelude
 
 import Futhark.Representation.AST
 import Futhark.MonadFreshNames
@@ -86,20 +89,17 @@ letExp _ (BasicOp (SubExp (Var v))) =
 letExp desc e = do
   n <- length <$> expExtType e
   vs <- replicateM n $ newVName desc
-  idents <- letBindNames' vs e
+  idents <- letBindNames vs e
   case idents of
     [ident] -> return $ identName ident
     _       -> fail $ "letExp: tuple-typed expression given:\n" ++ pretty e
 
 letInPlace :: MonadBinder m =>
-              String -> Certificates -> VName -> Slice SubExp -> Exp (Lore m)
+              String -> VName -> Slice SubExp -> Exp (Lore m)
            -> m VName
-letInPlace desc cs src slice e = do
-  v <- newVName desc
-  idents <- letBindNames [(v,BindInPlace cs src slice)] e
-  case idents of
-    [ident] -> return $ identName ident
-    _       -> fail $ "letExp: tuple-typed expression given:\n" ++ pretty e
+letInPlace desc src slice e = do
+  tmp <- letSubExp (desc ++ "_tmp") e
+  letExp desc $ BasicOp $ Update src slice tmp
 
 letSubExps :: MonadBinder m =>
               String -> [Exp (Lore m)] -> m [SubExp]
@@ -117,28 +117,43 @@ letTupExp _ (BasicOp (SubExp (Var v))) =
 letTupExp name e = do
   numValues <- length <$> expExtType e
   names <- replicateM numValues $ newVName name
-  map identName <$> letBindNames' names e
+  map identName <$> letBindNames names e
 
 letTupExp' :: (MonadBinder m) =>
               String -> Exp (Lore m)
            -> m [SubExp]
 letTupExp' _ (BasicOp (SubExp se)) = return [se]
-letTupExp' name ses = do vs <- letTupExp name ses
-                         return $ map Var vs
+letTupExp' name ses = map Var <$> letTupExp name ses
 
 eSubExp :: MonadBinder m =>
            SubExp -> m (Exp (Lore m))
 eSubExp = pure . BasicOp . SubExp
 
-eIf :: MonadBinder m =>
+eIf :: (MonadBinder m, BranchType (Lore m) ~ ExtType) =>
        m (Exp (Lore m)) -> m (Body (Lore m)) -> m (Body (Lore m))
     -> m (Exp (Lore m))
-eIf ce te fe = do
+eIf ce te fe = eIf' ce te fe IfNormal
+
+-- | As 'eIf', but an 'IfSort' can be given.
+eIf' :: (MonadBinder m, BranchType (Lore m) ~ ExtType) =>
+        m (Exp (Lore m)) -> m (Body (Lore m)) -> m (Body (Lore m))
+     -> IfSort
+     -> m (Exp (Lore m))
+eIf' ce te fe if_sort = do
   ce' <- letSubExp "cond" =<< ce
   te' <- insertStmsM te
   fe' <- insertStmsM fe
+  -- We need to construct the context.
   ts <- generaliseExtTypes <$> bodyExtType te' <*> bodyExtType fe'
-  return $ If ce' te' fe' ts
+  te'' <- addContextForBranch ts te'
+  fe'' <- addContextForBranch ts fe'
+  return $ If ce' te'' fe'' $ IfAttr ts if_sort
+  where addContextForBranch ts (Body _ stms val_res) = do
+          body_ts <- extendedScope (traverse subExpType val_res) stmsscope
+          let ctx_res = map snd $ sortOn fst $
+                        M.toList $ shapeExtMapping ts body_ts
+          mkBodyM stms $ ctx_res++val_res
+            where stmsscope = scopeOf stms
 
 eBinOp :: MonadBinder m =>
           BinOp -> m (Exp (Lore m)) -> m (Exp (Lore m))
@@ -155,6 +170,13 @@ eCmpOp op x y = do
   x' <- letSubExp "x" =<< x
   y' <- letSubExp "y" =<< y
   return $ BasicOp $ CmpOp op x' y'
+
+eConvOp :: MonadBinder m =>
+           ConvOp -> m (Exp (Lore m))
+        -> m (Exp (Lore m))
+eConvOp op x = do
+  x' <- letSubExp "x" =<< x
+  return $ BasicOp $ ConvOp op x'
 
 eNegate :: MonadBinder m =>
            m (Exp (Lore m)) -> m (Exp (Lore m))
@@ -174,9 +196,7 @@ eNegate em = do
 
 eNot :: MonadBinder m =>
         m (Exp (Lore m)) -> m (Exp (Lore m))
-eNot e = do
-  e' <- letSubExp "not_arg" =<< e
-  return $ BasicOp $ UnOp Not e'
+eNot e = BasicOp . UnOp Not <$> (letSubExp "not_arg" =<< e)
 
 eAbs :: MonadBinder m =>
         m (Exp (Lore m)) -> m (Exp (Lore m))
@@ -206,29 +226,12 @@ eSignum em = do
 
 eCopy :: MonadBinder m =>
          m (Exp (Lore m)) -> m (Exp (Lore m))
-eCopy e = do e' <- letExp "copy_arg" =<< e
-             return $ BasicOp $ Copy e'
+eCopy e = BasicOp . Copy <$> (letExp "copy_arg" =<< e)
 
 eAssert :: MonadBinder m =>
-         m (Exp (Lore m)) -> SrcLoc -> m (Exp (Lore m))
-eAssert e loc = do e' <- letSubExp "assert_arg" =<< e
-                   return $ BasicOp $ Assert e' loc
-
-eValue :: MonadBinder m => Value -> m (Exp (Lore m))
-eValue (PrimVal bv) =
-  return $ BasicOp $ SubExp $ Constant bv
-eValue (ArrayVal a bt [_]) = do
-  let ses = map Constant $ A.elems a
-  return $ BasicOp $ ArrayLit ses $ Prim bt
-eValue (ArrayVal a bt shape) = do
-  let rowshape = drop 1 shape
-      rowsize  = product rowshape
-      rows     = [ ArrayVal (A.listArray (0,rowsize-1) r) bt rowshape
-                 | r <- chunk rowsize $ A.elems a ]
-      rowtype = Array bt (Shape $ map (intConst Int32 . toInteger) rowshape)
-                NoUniqueness
-  ses <- mapM (letSubExp "array_elem" <=< eValue) rows
-  return $ BasicOp $ ArrayLit ses rowtype
+         m (Exp (Lore m)) -> ErrorMsg SubExp -> SrcLoc -> m (Exp (Lore m))
+eAssert e msg loc = do e' <- letSubExp "assert_arg" =<< e
+                       return $ BasicOp $ Assert e' msg (loc, mempty)
 
 eBody :: (MonadBinder m) =>
          [m (Exp (Lore m))]
@@ -236,15 +239,13 @@ eBody :: (MonadBinder m) =>
 eBody es = insertStmsM $ do
              es' <- sequence es
              xs <- mapM (letTupExp "x") es'
-             mkBodyM [] $ map Var $ concat xs
+             mkBodyM mempty $ map Var $ concat xs
 
 eLambda :: MonadBinder m =>
-           Lambda (Lore m) -> [SubExp] -> m [SubExp]
-eLambda lam args = do zipWithM_ letBindNames params $
-                        map (BasicOp . SubExp) args
+           Lambda (Lore m) -> [m (Exp (Lore m))] -> m [SubExp]
+eLambda lam args = do zipWithM_ bindParam (lambdaParams lam) args
                       bodyBind $ lambdaBody lam
-  where params = [ [(param, BindVar)] |
-                   param <- map paramName $ lambdaParams lam ]
+  where bindParam param arg = letBindNames_ [paramName param] =<< arg
 
 -- | Note: unsigned division.
 eDivRoundingUp :: MonadBinder m =>
@@ -260,6 +261,69 @@ eRoundToMultipleOf t x d =
   where eMod = eBinOp (SMod t)
         eMinus = eBinOp (Sub t)
         ePlus = eBinOp (Add t)
+
+-- | Construct an 'Index' expressions that slices an array with unit stride.
+eSliceArray :: MonadBinder m =>
+               Int -> VName -> m (Exp (Lore m)) -> m (Exp (Lore m))
+            -> m (Exp (Lore m))
+eSliceArray d arr i n = do
+  arr_t <- lookupType arr
+  let skips = map (slice (constant (0::Int32))) $ take d $ arrayDims arr_t
+  i' <- letSubExp "slice_i" =<< i
+  n' <- letSubExp "slice_n" =<< n
+  return $ BasicOp $ Index arr $ fullSlice arr_t $ skips ++ [slice i' n']
+  where slice j m = DimSlice j m (constant (1::Int32))
+
+-- | Construct an 'Index' expressions that splits an array in different parts along the outer dimension.
+eSplitArray :: MonadBinder m =>
+               VName -> [m (Exp (Lore m))] -> m [Exp (Lore m)]
+eSplitArray arr sizes = do
+  sizes' <- mapM (letSubExp "split_size") =<< sequence sizes
+  -- Compute the starting offset for each slice.
+  (_, offsets) <- mapAccumLM increase (intConst Int32 0) sizes'
+  zipWithM (eSliceArray 0 arr) (map eSubExp offsets) (map eSubExp sizes')
+  where increase offset size = do
+          offset' <- letSubExp "offset" $ BasicOp $ BinOp (Add Int32) offset size
+          return (offset', offset)
+
+-- | Are these indexes out-of-bounds for the array?
+eOutOfBounds :: MonadBinder m =>
+                VName -> [m (Exp (Lore m))] -> m (Exp (Lore m))
+eOutOfBounds arr is = do
+  arr_t <- lookupType arr
+  let ws = arrayDims arr_t
+  is' <- mapM (letSubExp "write_i") =<< sequence is
+  let checkDim w i = do
+        less_than_zero <- letSubExp "less_than_zero" $
+          BasicOp $ CmpOp (CmpSlt Int32) i (constant (0::Int32))
+        greater_than_size <- letSubExp "greater_than_size" $
+          BasicOp $ CmpOp (CmpSle Int32) w i
+        letSubExp "outside_bounds_dim" $
+          BasicOp $ BinOp LogOr less_than_zero greater_than_size
+  foldBinOp LogOr (constant False) =<< zipWithM checkDim ws is'
+
+-- | Write to an index of the array, if within bounds.  Otherwise,
+-- nothing.  Produces the updated array.
+eWriteArray :: (MonadBinder m, BranchType (Lore m) ~ ExtType) =>
+               VName -> [m (Exp (Lore m))] -> m (Exp (Lore m))
+            -> m (Exp (Lore m))
+eWriteArray arr is v = do
+  arr_t <- lookupType arr
+  is' <- mapM (letSubExp "write_i") =<< sequence is
+  v' <- letSubExp "write_v" =<< v
+
+  outside_bounds <- letSubExp "outside_bounds" =<< eOutOfBounds arr is
+
+  outside_bounds_branch <- insertStmsM $ resultBodyM [Var arr]
+
+  in_bounds_branch <- insertStmsM $ do
+    res <- letInPlace "write_out_inside_bounds" arr
+           (fullSlice arr_t (map DimFix is')) $ BasicOp $ SubExp v'
+    resultBodyM [Var res]
+
+  return $
+    If outside_bounds outside_bounds_branch in_bounds_branch $
+    ifCommon [arr_t]
 
 -- | Sign-extend to the given integer type.
 asIntS :: MonadBinder m => IntType -> SubExp -> m SubExp
@@ -294,23 +358,23 @@ foldBinOp bop ne (e:es) =
 -- operation to its arguments.  It is assumed that both argument and
 -- result types are the same.  (This assumption should be fixed at
 -- some point.)
-binOpLambda :: (MonadFreshNames m, Bindable lore) =>
-               BinOp -> PrimType -> m (Lambda lore)
+binOpLambda :: (MonadBinder m, Bindable (Lore m)) =>
+               BinOp -> PrimType -> m (Lambda (Lore m))
 binOpLambda bop t = binLambda (BinOp bop) t t
 
 -- | As 'binOpLambda', but for 'CmpOp's.
-cmpOpLambda :: (MonadFreshNames m, Bindable lore) =>
-               CmpOp -> PrimType -> m (Lambda lore)
+cmpOpLambda :: (MonadBinder m, Bindable (Lore m)) =>
+               CmpOp -> PrimType -> m (Lambda (Lore m))
 cmpOpLambda cop t = binLambda (CmpOp cop) t Bool
 
-binLambda :: (MonadFreshNames m, Bindable lore) =>
-             (SubExp -> SubExp -> BasicOp lore) -> PrimType -> PrimType
-          -> m (Lambda lore)
+binLambda :: (MonadBinder m, Bindable (Lore m)) =>
+             (SubExp -> SubExp -> BasicOp (Lore m)) -> PrimType -> PrimType
+          -> m (Lambda (Lore m))
 binLambda bop arg_t ret_t = do
   x   <- newVName "x"
   y   <- newVName "y"
-  (body, _) <- runBinderEmptyEnv $ insertStmsM $ do
-    res <- letSubExp "res" $ BasicOp $ bop (Var x) (Var y)
+  body <- insertStmsM $ do
+    res <- letSubExp "binlam_res" $ BasicOp $ bop (Var x) (Var y)
     return $ resultBody [res]
   return Lambda {
              lambdaParams     = [Param x (Prim arg_t),
@@ -334,16 +398,28 @@ fullSliceNum :: Num d => [d] -> [DimIndex d] -> Slice d
 fullSliceNum dims slice =
   slice ++ map (\d -> DimSlice 0 d 1) (drop (length slice) dims)
 
+-- | Does the slice describe the full size of the array?  The most
+-- obvious such slice is one that 'DimSlice's the full span of every
+-- dimension, but also one that fixes all unit dimensions.
+isFullSlice :: Shape -> Slice SubExp -> Bool
+isFullSlice shape slice = and $ zipWith allOfIt (shapeDims shape) slice
+  where allOfIt (Constant v) DimFix{} = oneIsh v
+        allOfIt d (DimSlice _ n _) = d == n
+        allOfIt _ _ = False
+
+ifCommon :: [Type] -> IfAttr ExtType
+ifCommon ts = IfAttr (staticShapes ts) IfNormal
+
 -- | Conveniently construct a body that contains no bindings.
 resultBody :: Bindable lore => [SubExp] -> Body lore
-resultBody = mkBody []
+resultBody = mkBody mempty
 
 -- | Conveniently construct a body that contains no bindings - but
 -- this time, monadically!
 resultBodyM :: MonadBinder m =>
                [SubExp]
             -> m (Body (Lore m))
-resultBodyM = mkBodyM []
+resultBodyM = mkBodyM mempty
 
 -- | Evaluate the action, producing a body, then wrap it in all the
 -- bindings it created using 'addStm'.
@@ -353,17 +429,8 @@ insertStmsM m = do
   (Body _ bnds res, otherbnds) <- collectStms m
   mkBodyM (otherbnds <> bnds) res
 
--- | Change that subexpression where evaluation of the body would
--- stop.
-mapResultM :: MonadBinder m =>
-              (Result -> m (Body (Lore m))) -> Body (Lore m) -> m (Body (Lore m))
-mapResultM f (Body _ bnds res) = do
-  Body _ bnds2 res' <- f res
-  mkBodyM (bnds++bnds2) res'
-
 -- | Change that result where evaluation of the body would stop.  Also
--- change type annotations at branches.  This a non-monadic variant of
--- @mapResultM@.
+-- change type annotations at branches.
 mapResult :: Bindable lore =>
              (Result -> Body lore) -> Body lore -> Body lore
 mapResult f (Body _ bnds res) =
@@ -380,7 +447,7 @@ instantiateShapes :: Monad m =>
                   -> m [TypeBase Shape u]
 instantiateShapes f ts = evalStateT (mapM instantiate ts) M.empty
   where instantiate t = do
-          shape <- mapM instantiate' $ extShapeDims $ arrayShape t
+          shape <- mapM instantiate' $ shapeDims $ arrayShape t
           return $ t `setArrayShape` Shape shape
         instantiate' (Ext x) = do
           m <- get
@@ -439,7 +506,7 @@ removeExistentials :: ExtType -> Type -> Type
 removeExistentials t1 t2 =
   t1 `setArrayDims`
   zipWith nonExistential
-  (extShapeDims $ arrayShape t1)
+  (shapeDims $ arrayShape t1)
   (arrayDims t2)
   where nonExistential (Ext _)    dim = dim
         nonExistential (Free dim) _   = dim
@@ -448,20 +515,13 @@ removeExistentials t1 t2 =
 -- instance for simple representations.
 simpleMkLetNames :: (ExpAttr lore ~ (), LetAttr lore ~ Type,
                      MonadFreshNames m, TypedOp (Op lore), HasScope lore m) =>
-                    [(VName, Bindage)] -> Exp lore -> m (Stm lore)
+                    [VName] -> Exp lore -> m (Stm lore)
 simpleMkLetNames names e = do
   et <- expExtType e
   (ts, shapes) <- instantiateShapes' et
-  let shapeElems = [ PatElem shape BindVar shapet
-                   | Ident shape shapet <- shapes
-                   ]
-      mkValElem (name, BindVar) t =
-        return $ PatElem name BindVar t
-      mkValElem (name, bindage@(BindInPlace _ src _)) _ = do
-        srct <- lookupType src
-        return $ PatElem name bindage srct
-  valElems <- zipWithM mkValElem names ts
-  return $ Let (Pattern shapeElems valElems) () e
+  let shapeElems = [ PatElem shape shapet | Ident shape shapet <- shapes ]
+  let valElems = zipWith PatElem names ts
+  return $ Let (Pattern shapeElems valElems) (StmAux mempty ()) e
 
 -- | Instances of this class can be converted to Futhark expressions
 -- within a 'MonadBinder'.

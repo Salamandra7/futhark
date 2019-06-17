@@ -26,10 +26,10 @@ let main(arr: []i32): ([]i32,[][][]i32) =
                   map (\(x: i32): i32  -> 2*x*a
                      ) (iota(3) )
               ) arr
-  in (reduce (\a b -> map (+) a b) (
+  in (reduce (\a b -> map2 (+) a b) (
              replicate 3 0) vs,
       map (\(r: []i32): [][]i32  ->
-             transpose(replicate 5 r)) vs)
+             transpose (replicate 5 r)) vs)
 
 
 let main0(arr: []i32): i32 =

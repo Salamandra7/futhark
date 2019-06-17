@@ -1,4 +1,3 @@
------------------------------------------------------------------------------
 -- |
 --
 -- Functions for generic traversals across Futhark syntax trees.  The
@@ -16,48 +15,34 @@
 -- tree.  The implementation is rather tedious, but the interface is
 -- easy to use.
 --
--- A traversal of the Futhark syntax tree is expressed as a tuple of
+-- A traversal of the Futhark syntax tree is expressed as a record of
 -- functions expressing the operations to be performed on the various
 -- types of nodes.
 --
--- The "Futhark.Transform.Rename" is a simple example of how to use
--- this facility.
---
------------------------------------------------------------------------------
+-- The "Futhark.Transform.Rename" module is a simple example of how to
+-- use this facility.
 module Futhark.Representation.AST.Traversals
   (
   -- * Mapping
     Mapper(..)
   , identityMapper
-  , mapBody
   , mapExpM
   , mapExp
   , mapOnType
   , mapOnLoopForm
-
-  -- * Folding
-  , Folder(..)
-  , foldExpM
-  , foldExp
-  , identityFolder
+  , mapOnExtType
 
   -- * Walking
   , Walker(..)
   , identityWalker
   , walkExpM
-  , walkExp
-  -- * Simple wrappers
   )
   where
 
-import Control.Applicative
 import Control.Monad
 import Control.Monad.Identity
-import Control.Monad.Writer
-import Control.Monad.State
 import qualified Data.Traversable
-
-import Prelude
+import Data.Monoid ((<>))
 
 import Futhark.Representation.AST.Syntax
 import Futhark.Representation.AST.Attributes.Scope
@@ -71,9 +56,10 @@ data Mapper flore tlore m = Mapper {
     -- ^ Most bodies are enclosed in a scope, which is passed along
     -- for convenience.
   , mapOnVName :: VName -> m VName
-  , mapOnCertificates :: Certificates -> m Certificates
   , mapOnRetType :: RetType flore -> m (RetType tlore)
+  , mapOnBranchType :: BranchType flore -> m (BranchType tlore)
   , mapOnFParam :: FParam flore -> m (FParam tlore)
+  , mapOnLParam :: LParam flore -> m (LParam tlore)
   , mapOnOp :: Op flore -> m (Op tlore)
   }
 
@@ -83,15 +69,12 @@ identityMapper = Mapper {
                    mapOnSubExp = return
                  , mapOnBody = const return
                  , mapOnVName = return
-                 , mapOnCertificates = return
                  , mapOnRetType = return
+                 , mapOnBranchType = return
                  , mapOnFParam = return
+                 , mapOnLParam = return
                  , mapOnOp = return
                  }
-
--- | Map across the bindings of a 'Body'.
-mapBody :: (Stm lore -> Stm lore) -> Body lore -> Body lore
-mapBody f (Body attr bnds res) = Body attr (map f bnds) res
 
 -- | Map a monadic action across the immediate children of an
 -- expression.  Importantly, the 'mapOnExp' action is not invoked for
@@ -112,61 +95,53 @@ mapExpM tv (BasicOp (ConvOp conv x)) =
   BasicOp <$> (ConvOp conv <$> mapOnSubExp tv x)
 mapExpM tv (BasicOp (UnOp op x)) =
   BasicOp <$> (UnOp op <$> mapOnSubExp tv x)
-mapExpM tv (If c texp fexp ts) =
-  pure If <*> mapOnSubExp tv c <*> mapOnBody tv mempty texp <*> mapOnBody tv mempty fexp <*>
-       mapM (mapOnExtType tv) ts
-mapExpM tv (Apply fname args ret) = do
+mapExpM tv (If c texp fexp (IfAttr ts s)) =
+  If <$> mapOnSubExp tv c <*> mapOnBody tv mempty texp <*> mapOnBody tv mempty fexp <*>
+        (IfAttr <$> mapM (mapOnBranchType tv) ts <*> pure s)
+mapExpM tv (Apply fname args ret loc) = do
   args' <- forM args $ \(arg, d) ->
              (,) <$> mapOnSubExp tv arg <*> pure d
-  pure (Apply fname) <*> pure args' <*>
-    mapOnRetType tv ret
-mapExpM tv (BasicOp (Index cs arr slice)) =
-  BasicOp <$> (pure Index <*> mapOnCertificates tv cs <*>
-              mapOnVName tv arr <*>
-              mapM (Data.Traversable.traverse (mapOnSubExp tv)) slice)
+  Apply fname <$> pure args' <*> mapM (mapOnRetType tv) ret <*> pure loc
+mapExpM tv (BasicOp (Index arr slice)) =
+  BasicOp <$> (Index <$> mapOnVName tv arr <*>
+               mapM (traverse (mapOnSubExp tv)) slice)
+mapExpM tv (BasicOp (Update arr slice se)) =
+  BasicOp <$> (Update <$> mapOnVName tv arr <*>
+               mapM (traverse (mapOnSubExp tv)) slice <*> mapOnSubExp tv se)
 mapExpM tv (BasicOp (Iota n x s et)) =
   BasicOp <$> (pure Iota <*> mapOnSubExp tv n <*> mapOnSubExp tv x <*> mapOnSubExp tv s <*> pure et)
 mapExpM tv (BasicOp (Replicate shape vexp)) =
-  BasicOp <$> (Replicate
-               <$> (Shape <$> mapM (mapOnSubExp tv) (shapeDims shape))
-               <*> mapOnSubExp tv vexp)
+  BasicOp <$> (Replicate <$> mapOnShape tv shape <*> mapOnSubExp tv vexp)
+mapExpM tv (BasicOp (Repeat shapes innershape v)) =
+  BasicOp <$> (Repeat <$> mapM (mapOnShape tv) shapes <*>
+               mapOnShape tv innershape <*> mapOnVName tv v)
 mapExpM tv (BasicOp (Scratch t shape)) =
   BasicOp <$> (Scratch t <$> mapM (mapOnSubExp tv) shape)
-mapExpM tv (BasicOp (Reshape cs shape arrexp)) =
-  BasicOp <$> (pure Reshape <*> mapOnCertificates tv cs <*>
-                 mapM (Data.Traversable.traverse (mapOnSubExp tv)) shape <*>
-                 mapOnVName tv arrexp)
-mapExpM tv (BasicOp (Rearrange cs perm e)) =
-  BasicOp <$> (pure Rearrange <*> mapOnCertificates tv cs <*>
-                 pure perm <*> mapOnVName tv e)
-mapExpM tv (BasicOp (Rotate cs es e)) =
-  BasicOp <$> (pure Rotate <*> mapOnCertificates tv cs <*>
-              mapM (mapOnSubExp tv) es <*> mapOnVName tv e)
-mapExpM tv (BasicOp (Split cs i sizeexps arrexp)) =
-  BasicOp <$> (pure Split <*> mapOnCertificates tv cs <*> pure i <*>
-              mapM (mapOnSubExp tv) sizeexps <*> mapOnVName tv arrexp)
-mapExpM tv (BasicOp (Concat cs i x ys size)) =
-  BasicOp <$> (pure Concat <*> mapOnCertificates tv cs <*> pure i <*>
+mapExpM tv (BasicOp (Reshape shape arrexp)) =
+  BasicOp <$> (Reshape <$>
+               mapM (Data.Traversable.traverse (mapOnSubExp tv)) shape <*>
+               mapOnVName tv arrexp)
+mapExpM tv (BasicOp (Rearrange perm e)) =
+  BasicOp <$> (Rearrange <$> pure perm <*> mapOnVName tv e)
+mapExpM tv (BasicOp (Rotate es e)) =
+  BasicOp <$> (Rotate <$> mapM (mapOnSubExp tv) es <*> mapOnVName tv e)
+mapExpM tv (BasicOp (Concat i x ys size)) =
+  BasicOp <$> (Concat <$> pure i <*>
               mapOnVName tv x <*> mapM (mapOnVName tv) ys <*>
               mapOnSubExp tv size)
 mapExpM tv (BasicOp (Copy e)) =
   BasicOp <$> (pure Copy <*> mapOnVName tv e)
 mapExpM tv (BasicOp (Manifest perm e)) =
   BasicOp <$> (Manifest perm <$> mapOnVName tv e)
-mapExpM tv (BasicOp (Assert e loc)) =
-  BasicOp <$> (pure Assert <*> mapOnSubExp tv e <*> pure loc)
+mapExpM tv (BasicOp (Assert e msg loc)) =
+  BasicOp <$> (Assert <$> mapOnSubExp tv e <*> traverse (mapOnSubExp tv) msg <*> pure loc)
 mapExpM tv (BasicOp (Opaque e)) =
   BasicOp <$> (Opaque <$> mapOnSubExp tv e)
-mapExpM tv (BasicOp (Partition cs n flags arr)) =
-  BasicOp <$> (pure Partition <*> mapOnCertificates tv cs <*>
-              pure n <*>
-              mapOnVName tv flags <*>
-              mapM (mapOnVName tv) arr)
 mapExpM tv (DoLoop ctxmerge valmerge form loopbody) = do
   ctxparams' <- mapM (mapOnFParam tv) ctxparams
   valparams' <- mapM (mapOnFParam tv) valparams
   form' <- mapOnLoopForm tv form
-  let scope = scopeOfLoopForm form' <> scopeOfFParams (ctxparams'++valparams')
+  let scope = scopeOf form' <> scopeOfFParams (ctxparams'++valparams')
   DoLoop <$>
     (zip ctxparams' <$> mapM (mapOnSubExp tv) ctxinits) <*>
     (zip valparams' <$> mapM (mapOnSubExp tv) valinits) <*>
@@ -176,20 +151,25 @@ mapExpM tv (DoLoop ctxmerge valmerge form loopbody) = do
 mapExpM tv (Op op) =
   Op <$> mapOnOp tv op
 
+mapOnShape :: Monad m => Mapper flore tlore m -> Shape -> m Shape
+mapOnShape tv (Shape ds) = Shape <$> mapM (mapOnSubExp tv) ds
+
 mapOnExtType :: Monad m =>
                 Mapper flore tlore m -> TypeBase ExtShape u -> m (TypeBase ExtShape u)
-mapOnExtType tv (Array bt (ExtShape shape) u) =
-  Array bt <$> (ExtShape <$> mapM mapOnExtSize shape) <*>
+mapOnExtType tv (Array bt (Shape shape) u) =
+  Array bt <$> (Shape <$> mapM mapOnExtSize shape) <*>
   return u
   where mapOnExtSize (Ext x)   = return $ Ext x
         mapOnExtSize (Free se) = Free <$> mapOnSubExp tv se
 mapOnExtType _ (Prim bt) = return $ Prim bt
-mapOnExtType tv (Mem size space) = Mem <$> mapOnSubExp tv size <*> pure space
+mapOnExtType _ (Mem space) = pure $ Mem space
 
 mapOnLoopForm :: Monad m =>
-                 Mapper flore tlore m -> LoopForm -> m LoopForm
-mapOnLoopForm tv (ForLoop i it bound) =
-  ForLoop <$> mapOnVName tv i <*> pure it <*> mapOnSubExp tv bound
+                 Mapper flore tlore m -> LoopForm flore -> m (LoopForm tlore)
+mapOnLoopForm tv (ForLoop i it bound loop_vars) =
+  ForLoop <$> mapOnVName tv i <*> pure it <*> mapOnSubExp tv bound <*>
+  (zip <$> mapM (mapOnLParam tv) loop_lparams <*> mapM (mapOnVName tv) loop_arrs)
+  where (loop_lparams,loop_arrs) = unzip loop_vars
 mapOnLoopForm tv (WhileLoop cond) =
   WhileLoop <$> mapOnVName tv cond
 
@@ -200,61 +180,9 @@ mapExp m = runIdentity . mapExpM m
 mapOnType :: Monad m =>
              (SubExp -> m SubExp) -> Type -> m Type
 mapOnType _ (Prim bt) = return $ Prim bt
-mapOnType f (Mem size space) = Mem <$> f size <*> pure space
+mapOnType _ (Mem space) = pure $ Mem space
 mapOnType f (Array bt shape u) =
   Array bt <$> (Shape <$> mapM f (shapeDims shape)) <*> pure u
-
--- | Reification of a left-reduction across a syntax tree.
-data Folder a lore m = Folder {
-    foldOnSubExp :: a -> SubExp -> m a
-  , foldOnBody :: a -> Body lore -> m a
-  , foldOnStm :: a -> Stm lore -> m a
-  , foldOnVName :: a -> VName -> m a
-  , foldOnCertificates :: a -> Certificates -> m a
-  , foldOnRetType :: a -> RetType lore -> m a
-  , foldOnFParam :: a -> FParam lore -> m a
-  , foldOnLParam :: a -> LParam lore -> m a
-  , foldOnOp :: a -> Op lore -> m a
-  }
-
--- | A folding operation where the accumulator is returned verbatim.
-identityFolder :: Monad m => Folder a lore m
-identityFolder = Folder {
-                   foldOnSubExp = const . return
-                 , foldOnBody = const . return
-                 , foldOnStm = const . return
-                 , foldOnVName = const . return
-                 , foldOnCertificates = const . return
-                 , foldOnRetType = const . return
-                 , foldOnFParam = const . return
-                 , foldOnLParam = const . return
-                 , foldOnOp = const . return
-                 }
-
-foldMapper :: Monad m => Folder a lore m -> Mapper lore lore (StateT a m)
-foldMapper f = Mapper {
-                 mapOnSubExp = wrap foldOnSubExp
-               , mapOnBody = const $ wrap foldOnBody
-               , mapOnVName = wrap foldOnVName
-               , mapOnCertificates = wrap foldOnCertificates
-               , mapOnRetType = wrap foldOnRetType
-               , mapOnFParam = wrap foldOnFParam
-               , mapOnOp = wrap foldOnOp
-               }
-  where wrap op k = do
-          v <- get
-          put =<< lift (op f v k)
-          return k
-
--- | Perform a left-reduction across the immediate children of a body.
--- The reduction does not descend recursively into subterms and is
--- done left-to-right.
-foldExpM :: Monad m => Folder a lore m -> a -> Exp lore -> m a
-foldExpM f x e = execStateT (mapExpM (foldMapper f) e) x
-
--- | As 'foldExpM', but in the 'Identity' monad.
-foldExp :: Folder a lore Identity -> a -> Exp lore -> a
-foldExp m x = runIdentity . foldExpM m x
 
 -- | Express a monad expression on a syntax node.  Each element of
 -- this structure expresses the action to be performed on a given
@@ -263,8 +191,8 @@ data Walker lore m = Walker {
     walkOnSubExp :: SubExp -> m ()
   , walkOnBody :: Body lore -> m ()
   , walkOnVName :: VName -> m ()
-  , walkOnCertificates :: Certificates -> m ()
   , walkOnRetType :: RetType lore -> m ()
+  , walkOnBranchType :: BranchType lore -> m ()
   , walkOnFParam :: FParam lore -> m ()
   , walkOnLParam :: LParam lore -> m ()
   , walkOnOp :: Op lore -> m ()
@@ -276,8 +204,8 @@ identityWalker = Walker {
                    walkOnSubExp = const $ return ()
                  , walkOnBody = const $ return ()
                  , walkOnVName = const $ return ()
-                 , walkOnCertificates = const $ return ()
                  , walkOnRetType = const $ return ()
+                 , walkOnBranchType = const $ return ()
                  , walkOnFParam = const $ return ()
                  , walkOnLParam = const $ return ()
                  , walkOnOp = const $ return ()
@@ -288,9 +216,10 @@ walkMapper f = Mapper {
                  mapOnSubExp = wrap walkOnSubExp
                , mapOnBody = const $ wrap walkOnBody
                , mapOnVName = wrap walkOnVName
-               , mapOnCertificates = wrap walkOnCertificates
                , mapOnRetType = wrap walkOnRetType
+               , mapOnBranchType = wrap walkOnBranchType
                , mapOnFParam = wrap walkOnFParam
+               , mapOnLParam = wrap walkOnLParam
                , mapOnOp = wrap walkOnOp
                }
   where wrap op k = op f k >> return k
@@ -299,7 +228,3 @@ walkMapper f = Mapper {
 walkExpM :: Monad m => Walker lore m -> Exp lore -> m ()
 walkExpM f = void . mapExpM m
   where m = walkMapper f
-
--- | As 'walkExp', but runs in the 'Identity' monad..
-walkExp :: Walker lore Identity -> Exp lore -> ()
-walkExp f = runIdentity . walkExpM f

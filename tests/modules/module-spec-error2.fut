@@ -1,5 +1,6 @@
 -- ==
--- error: expecting
+-- error: Couldn't match expected type `M1.*with.*`M0
+
 
 module type MT = {
   module M: {type t val x: t val f: t -> t}

@@ -5,9 +5,7 @@
 -- map
 --   map
 --     map
--- map
---   map
---     concat
+-- concat
 -- map
 --   map
 --     reduce (which becomes a segmented reduction)
@@ -15,13 +13,12 @@
 -- ==
 --
 -- structure distributed {
---   Kernel 8
---   Concat 1
+--   Kernel 2 SegRed 1
 -- }
 
-let main(a: [#n][#an][]i32, b: [#n][#bn]i32): ([][]i32,[][]i32) =
-  unzip(map (\(a_row: [][]i32) (b_row: []i32): ([bn]i32,[an]i32)  ->
-                  (map (-1) (b_row),
+let main [n][an][bn] (a: [n][an][]i32, b: [n][bn]i32): ([][]i32,[][]i32) =
+  unzip(map2 (\(a_row: [][]i32) (b_row: []i32): ([bn]i32,[an]i32)  ->
+                  (map (\x -> x-1) (b_row),
                    map (\(a_row_row: []i32): i32  ->
                          let x = map (+1) (a_row_row) in
                          reduce (+) 0 (concat x x)

@@ -12,14 +12,14 @@
 --     [[67i32, 78i32],
 --      [91i32, 106i32]]]
 -- }
--- structure { Map 3 Map/Map/Map/Redomap 1 }
+-- structure { /Screma 1 /Screma/Screma 1 /Screma/Screma/Screma 1 /Screma/Screma/Screma/Screma 1 }
 
-let matmult(x: [#n][#m]i32) (y: [#m][#p]i32): [n][p]i32 =
+let matmult [n][m][p] (x: [n][m]i32) (y: [m][p]i32): [n][p]i32 =
   map (\xr ->
-         map (\yc -> reduce (+) 0 (map (*) xr yc))
+         map (\yc -> reduce (+) 0 (map2 (*) xr yc))
        (transpose y))
   x
 
 
-let main(xs: [#k][#n][#m]i32, ys: [#k][#m][#p]i32): [k][n][p]i32 =
-  map matmult xs ys
+let main [k][n][m][p] (xs: [k][n][m]i32) (ys: [k][m][p]i32): [k][n][p]i32 =
+  map2 matmult xs ys

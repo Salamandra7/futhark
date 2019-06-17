@@ -111,24 +111,19 @@
 -- -0.000443f32, 0.000283f32, -0.000084f32, 0.000129f32, 0.000419f32,
 -- -0.000178f32, -0.001124f32, -0.001211f32, 0.000297f32, 0.000291f32,
 -- 0.001163f32, 0.001455f32]]}
--- structure distributed { Kernel 6 }
+-- structure distributed { Kernel 1 SegRed 1 SegMap 1 }
 
-import "futlib/math"
 
-let main(nfeatures: i32, npoints: i32, nclusters: i32): [nclusters][nfeatures]f32 =
+let main (nfeatures: i32) (npoints: i32) (nclusters: i32): [nclusters][nfeatures]f32 =
   let membership = map (%nclusters) (iota(npoints))
   let features_in_cluster = replicate nclusters (npoints / nclusters)
   -- Just generate some random-seeming points.
   let points = map (\(i: i32): [nfeatures]f32  ->
-                     map (*100f32) (map f32.sin (map f32 (map (^i) (iota(nfeatures)))))
+                     map (*100f32) (map f32.sin (map r32 (map (^i) (iota(nfeatures)))))
                   ) (iota(npoints)) in
-  stream_red_per (\(acc: *[#nclusters][#nfeatures]f32)
-                  (elem: *[#nclusters][#nfeatures]f32): *[nclusters][nfeatures]f32  ->
-                 map (\(x: []f32) (y: []f32): [nfeatures]f32  ->
-                           map (+) x y) acc elem) (
-                 \(inp: [#chunk]([#nfeatures]f32,i32)): *[nclusters][nfeatures]f32  ->
-                   loop (acc = replicate nclusters (replicate nfeatures 0.0f32)) = for i < chunk do
-                     let (point, c) = inp[i] in
-                     unsafe let acc[c] = map (+) (acc[c]) (map (/f32(features_in_cluster[c])) point) in
-                     acc in
+  stream_red (\acc elem -> map2 (\x y -> map2 (+) x y) acc elem)
+             (\chunk (inp: [chunk]([nfeatures]f32,i32)) ->
+                 loop acc = replicate nclusters (replicate nfeatures 0.0f32) for i < chunk do
+                   let (point, c) = inp[i] in
+                   unsafe let acc[c] = map2 (+) (acc[c]) (map (/r32(features_in_cluster[c])) point) in
                    acc) (zip points membership)

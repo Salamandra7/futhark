@@ -8,13 +8,11 @@ module Futhark.Representation.AST.Attributes
   ( module Futhark.Representation.AST.Attributes.Reshape
   , module Futhark.Representation.AST.Attributes.Rearrange
   , module Futhark.Representation.AST.Attributes.Types
-  , module Futhark.Representation.AST.Attributes.Values
   , module Futhark.Representation.AST.Attributes.Constants
   , module Futhark.Representation.AST.Attributes.TypeOf
   , module Futhark.Representation.AST.Attributes.Patterns
   , module Futhark.Representation.AST.Attributes.Names
   , module Futhark.Representation.AST.RetType
-  , module Futhark.Representation.AST.Attributes.Context
 
   -- * Built-in functions
   , isBuiltInFunction
@@ -29,6 +27,11 @@ module Futhark.Representation.AST.Attributes
   , shapeVars
   , commutativeLambda
   , entryPointSize
+  , defAux
+  , stmCerts
+  , certify
+  , expExtTypesFromPattern
+  , patternFromParams
 
   , IsOp (..)
   , Attributes (..)
@@ -37,23 +40,22 @@ module Futhark.Representation.AST.Attributes
 
 import Data.List
 import Data.Maybe (mapMaybe, isJust)
+import Data.Monoid ((<>))
 import qualified Data.Map.Strict as M
 
 import Futhark.Representation.AST.Attributes.Reshape
 import Futhark.Representation.AST.Attributes.Rearrange
 import Futhark.Representation.AST.Attributes.Types
-import Futhark.Representation.AST.Attributes.Values
 import Futhark.Representation.AST.Attributes.Constants
 import Futhark.Representation.AST.Attributes.Patterns
 import Futhark.Representation.AST.Attributes.Names
 import Futhark.Representation.AST.Attributes.TypeOf
-import Futhark.Representation.AST.Attributes.Context
 import Futhark.Representation.AST.RetType
 import Futhark.Representation.AST.Syntax
 import Futhark.Representation.AST.Pretty
 import Futhark.Transform.Rename (Rename, Renameable)
 import Futhark.Transform.Substitute (Substitute, Substitutable)
-import Futhark.Util.Pretty (Pretty)
+import Futhark.Util.Pretty
 
 -- | @isBuiltInFunction k@ is 'True' if @k@ is an element of 'builtInFunctions'.
 isBuiltInFunction :: Name -> Bool
@@ -61,32 +63,8 @@ isBuiltInFunction fnm = fnm `M.member` builtInFunctions
 
 -- | A map of all built-in functions and their types.
 builtInFunctions :: M.Map Name (PrimType,[PrimType])
-builtInFunctions = M.fromList $ map namify
-                   [("sqrt32", (FloatType Float32, [FloatType Float32]))
-                   ,("log32", (FloatType Float32, [FloatType Float32]))
-                   ,("exp32", (FloatType Float32, [FloatType Float32]))
-                   ,("cos32", (FloatType Float32, [FloatType Float32]))
-                   ,("sin32", (FloatType Float32, [FloatType Float32]))
-                   ,("acos32", (FloatType Float32, [FloatType Float32]))
-                   ,("asin32", (FloatType Float32, [FloatType Float32]))
-                   ,("atan32", (FloatType Float32, [FloatType Float32]))
-                   ,("atan2_32", (FloatType Float32, [FloatType Float32, FloatType Float32]))
-                   ,("isinf32", (Bool, [FloatType Float32]))
-                   ,("isnan32", (Bool, [FloatType Float32]))
-
-                   ,("sqrt64", (FloatType Float64, [FloatType Float64]))
-                   ,("log64", (FloatType Float64, [FloatType Float64]))
-                   ,("exp64", (FloatType Float64, [FloatType Float64]))
-                   ,("cos64", (FloatType Float64, [FloatType Float64]))
-                   ,("sin64", (FloatType Float64, [FloatType Float64]))
-                   ,("atan64", (FloatType Float64, [FloatType Float64]))
-                   ,("acos64", (FloatType Float64, [FloatType Float64]))
-                   ,("asin64", (FloatType Float64, [FloatType Float64]))
-                   ,("atan2_64", (FloatType Float64, [FloatType Float64, FloatType Float64]))
-                   ,("isinf64", (Bool, [FloatType Float64]))
-                   ,("isnan64", (Bool, [FloatType Float64]))
-                   ]
-  where namify (k,v) = (nameFromString k, v)
+builtInFunctions = M.fromList $ map namify $ M.toList primFuns
+  where namify (k,(paramts,ret,_)) = (nameFromString k, (ret, paramts))
 
 -- | Find the function of the given name in the Futhark program.
 funDefByName :: Name -> Prog lore -> Maybe (FunDef lore)
@@ -111,24 +89,38 @@ safeExp (BasicOp op) = safeBasicOp op
         safeBasicOp (BinOp SMod{} _ _) = False
         safeBasicOp (BinOp UMod{} _ (Constant y)) = not $ zeroIsh y
         safeBasicOp (BinOp UMod{} _ _) = False
-        safeBasicOp (BinOp Pow{} (Constant x) _) = not $ zeroIsh x
+
+        safeBasicOp (BinOp SQuot{} _ (Constant y)) = not $ zeroIsh y
+        safeBasicOp (BinOp SQuot{} _ _) = False
+        safeBasicOp (BinOp SRem{} _ (Constant y)) = not $ zeroIsh y
+        safeBasicOp (BinOp SRem{} _ _) = False
+
+        safeBasicOp (BinOp Pow{} _ (Constant y)) = not $ negativeIsh y
         safeBasicOp (BinOp Pow{} _ _) = False
+        safeBasicOp ArrayLit{} = True
         safeBasicOp BinOp{} = True
         safeBasicOp SubExp{} = True
         safeBasicOp UnOp{} = True
         safeBasicOp CmpOp{} = True
         safeBasicOp ConvOp{} = True
+        safeBasicOp Scratch{} = True
+        safeBasicOp Concat{} = True
+        safeBasicOp Reshape{} = True
+        safeBasicOp Manifest{} = True
+        safeBasicOp Iota{} = True
+        safeBasicOp Replicate{} = True
+        safeBasicOp Copy{} = True
         safeBasicOp _ = False
 
 safeExp (DoLoop _ _ _ body) = safeBody body
-safeExp Apply{} = False
+safeExp (Apply fname _ _ _) = isBuiltInFunction fname
 safeExp (If _ tbranch fbranch _) =
-  all (safeExp . bindingExp) (bodyStms tbranch) &&
-  all (safeExp . bindingExp) (bodyStms fbranch)
+  all (safeExp . stmExp) (bodyStms tbranch) &&
+  all (safeExp . stmExp) (bodyStms fbranch)
 safeExp (Op op) = safeOp op
 
 safeBody :: IsOp (Op lore) => Body lore -> Bool
-safeBody = all (safeExp . bindingExp) . bodyStms
+safeBody = all (safeExp . stmExp) . bodyStms
 
 -- | Return the variable names used in 'Var' subexpressions.  May contain
 -- duplicates.
@@ -176,6 +168,18 @@ entryPointSize (TypeOpaque _ x) = x
 entryPointSize TypeUnsigned = 1
 entryPointSize TypeDirect = 1
 
+-- | A 'StmAux' with empty 'Certificates'.
+defAux :: attr -> StmAux attr
+defAux = StmAux mempty
+
+-- | The certificates associated with a statement.
+stmCerts :: Stm lore -> Certificates
+stmCerts = stmAuxCerts . stmAux
+
+-- | Add certificates to a statement.
+certify :: Certificates -> Stm lore -> Stm lore
+certify cs1 (Let pat (StmAux cs2 attr) e) = Let pat (StmAux (cs2<>cs1) attr) e
+
 -- | A type class for operations.
 class (Eq op, Ord op, Show op,
        TypedOp op,
@@ -205,16 +209,22 @@ class (Annotations lore,
        FreeIn (FParamAttr lore),
        FreeIn (LParamAttr lore),
        FreeIn (RetType lore),
+       FreeIn (BranchType lore),
 
        IsOp (Op lore)) => Attributes lore where
-  -- | As far as possible, determine the subexpression to which each
-  -- context pattern element will be bound due to evaluation of the
-  -- given expression.  The resulting list must have the same number
-  -- of elements as there are context elements in the pattern.
-  --
-  -- The default method invokes 'expExtContext'.
-  expContext :: (HasScope lore m, Monad m) =>
-                Pattern lore ->
-                Exp lore ->
-                m [Maybe SubExp]
-  expContext = expExtContext
+  -- | Given a pattern, construct the type of a body that would match
+  -- it.  An implementation for many lores would be
+  -- 'expExtTypesFromPattern'.
+  expTypesFromPattern :: (HasScope lore m, Monad m) =>
+                         Pattern lore -> m [BranchType lore]
+
+-- | Construct the type of an expression that would match the pattern.
+expExtTypesFromPattern :: Typed attr => PatternT attr -> [ExtType]
+expExtTypesFromPattern pat =
+  existentialiseExtTypes (patternContextNames pat) $
+  staticShapes $ map patElemType $ patternValueElements pat
+
+-- | Create a pattern corresponding to some parameters.
+patternFromParams :: [Param attr] -> PatternT attr
+patternFromParams = Pattern [] . map toPatElem
+  where toPatElem p = PatElem (paramName p) $ paramAttr p

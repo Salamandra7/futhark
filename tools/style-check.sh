@@ -12,6 +12,8 @@
 #
 #   3) Tabs, anywhere.
 #
+#   4) DOS line endings (CRLF).
+#
 # This script can be called on directories (in which case it applies
 # to every file inside), or on files.
 
@@ -30,7 +32,7 @@ hlintable() {
 
 hlint_check() {
     # Some hlint-suggestions are terrible, so ignore them here.
-    hlint -i "Use import/export shortcut" "$1"
+    hlint -i "Use import/export shortcut" -i "Use const" -i "Use tuple-section" "$1"
 }
 
 no_trailing_blank_lines() {
@@ -52,6 +54,12 @@ check() {
         echo
         echo "${cyan}Tab characters found in $file:${NC}"
         echo "$output"
+    fi
+
+    output=$(file "$file" | grep -q 'CRLF line terminators')
+    if [ $? = 0 ]; then
+        echo
+        echo "${cyan}CRLF line terminators in $file.${NC}"
     fi
 
     if hlintable "$file"; then

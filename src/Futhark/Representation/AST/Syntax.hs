@@ -12,28 +12,22 @@ module Futhark.Representation.AST.Syntax
   -- * Types
   , Uniqueness(..)
   , NoUniqueness(..)
-  , Shape(..)
-  , ExtDimSize(..)
-  , ExtShape(..)
   , Rank(..)
   , ArrayShape(..)
   , Space (..)
   , TypeBase(..)
   , Diet(..)
 
-  -- * Values
-  , PrimValue(..)
-  , Value(..)
-
   -- * Abstract syntax tree
   , Ident (..)
   , SubExp(..)
-  , Bindage (..)
   , PatElem
   , PatElemT (..)
   , PatternT (..)
   , Pattern
+  , StmAux(..)
   , Stm(..)
+  , Stms
   , Result
   , BodyT(..)
   , Body
@@ -47,10 +41,11 @@ module Futhark.Representation.AST.Syntax
   , ExpT(..)
   , Exp
   , LoopForm (..)
+  , IfAttr (..)
+  , IfSort (..)
+  , Safety (..)
   , LambdaT(..)
   , Lambda
-  , ExtLambdaT (..)
-  , ExtLambda
 
   -- * Definitions
   , ParamT (..)
@@ -62,16 +57,18 @@ module Futhark.Representation.AST.Syntax
   , EntryPointType(..)
   , ProgT(..)
   , Prog
+
+  -- * Utils
+  , oneStm
+  , stmsFromList
+  , stmsToList
+  , stmsHead
   )
   where
 
-import Control.Applicative
 import Data.Foldable
-import Data.Monoid
-import Data.Traversable
 import Data.Loc
-
-import Prelude
+import qualified Data.Sequence as Seq
 
 import Language.Futhark.Core
 import Futhark.Representation.AST.Annotations
@@ -89,30 +86,57 @@ data PatternT attr =
           }
   deriving (Ord, Show, Eq)
 
-instance Monoid (PatternT lore) where
+instance Functor PatternT where
+  fmap f (Pattern ctx val) = Pattern (map (fmap f) ctx) (map (fmap f) val)
+
+instance Semigroup (PatternT attr) where
+  Pattern cs1 vs1 <> Pattern cs2 vs2 = Pattern (cs1++cs2) (vs1++vs2)
+
+instance Monoid (PatternT attr) where
   mempty = Pattern [] []
-  Pattern cs1 vs1 `mappend` Pattern cs2 vs2 = Pattern (cs1++cs2) (vs1++vs2)
 
 -- | A type alias for namespace control.
 type Pattern lore = PatternT (LetAttr lore)
 
+-- | Auxilliary Information associated with a statement.
+data StmAux attr = StmAux { stmAuxCerts :: !Certificates
+                          , stmAuxAttr :: attr
+                          }
+                  deriving (Ord, Show, Eq)
+
 -- | A local variable binding.
-data Stm lore = Let { bindingPattern :: Pattern lore
-                        , bindingLore :: ExpAttr lore
-                        , bindingExp :: Exp lore
-                        }
+data Stm lore = Let { stmPattern :: Pattern lore
+                    , stmAux :: StmAux (ExpAttr lore)
+                    , stmExp :: Exp lore
+                    }
 
 deriving instance Annotations lore => Ord (Stm lore)
 deriving instance Annotations lore => Show (Stm lore)
 deriving instance Annotations lore => Eq (Stm lore)
+
+-- | A sequence of statements.
+type Stms lore = Seq.Seq (Stm lore)
+
+oneStm :: Stm lore -> Stms lore
+oneStm = Seq.singleton
+
+stmsFromList :: [Stm lore] -> Stms lore
+stmsFromList = Seq.fromList
+
+stmsToList :: Stms lore -> [Stm lore]
+stmsToList = toList
+
+stmsHead :: Stms lore -> Maybe (Stm lore, Stms lore)
+stmsHead stms = case Seq.viewl stms of stm Seq.:< stms' -> Just (stm, stms')
+                                       Seq.EmptyL       -> Nothing
 
 -- | The result of a body is a sequence of subexpressions.
 type Result = [SubExp]
 
 -- | A body consists of a number of bindings, terminating in a result
 -- (essentially a tuple literal).
-data BodyT lore = Body { bodyLore :: BodyAttr lore
-                       , bodyStms :: [Stm lore]
+data BodyT lore = Body { bodyAttr :: BodyAttr lore
+                       , bodyStms :: Stms lore
                        , bodyResult :: Result
                        }
 
@@ -126,14 +150,20 @@ type Body = BodyT
 -- | The new dimension in a 'Reshape'-like operation.  This allows us to
 -- disambiguate "real" reshapes, that change the actual shape of the
 -- array, from type coercions that are just present to make the types
--- work out.
+-- work out.  The two constructors are considered equal for purposes of 'Eq'.
 data DimChange d = DimCoercion d
                    -- ^ The new dimension is guaranteed to be numerically
                    -- equal to the old one.
                  | DimNew d
                    -- ^ The new dimension is not necessarily numerically
                    -- equal to the old one.
-                 deriving (Eq, Ord, Show)
+                 deriving (Ord, Show)
+
+instance Eq d => Eq (DimChange d) where
+  DimCoercion x == DimNew y = x == y
+  DimCoercion x == DimCoercion y = x == y
+  DimNew x == DimCoercion y = x == y
+  DimNew x == DimNew y = x == y
 
 instance Functor DimChange where
   fmap f (DimCoercion d) = DimCoercion $ f d
@@ -154,8 +184,7 @@ type ShapeChange d = [DimChange d]
 -- does not itself contain any bindings.
 data BasicOp lore
   = SubExp SubExp
-    -- ^ Subexpressions, doubling as tuple literals if the
-    -- list has anything but a single element.
+    -- ^ A variable or constant.
 
   | Opaque SubExp
     -- ^ Semantically and operationally just identity, but is
@@ -165,15 +194,14 @@ data BasicOp lore
 
   | ArrayLit  [SubExp] Type
     -- ^ Array literals, e.g., @[ [1+x, 3], [2, 1+4] ]@.
-    -- Second arg is the element type of of the rows of the array.
+    -- Second arg is the element type of the rows of the array.
     -- Scalar operations
 
   | UnOp UnOp SubExp
-    -- ^ Unary operation - result type is the same as the input type.
+    -- ^ Unary operation.
 
   | BinOp BinOp SubExp SubExp
-    -- ^ Binary operation - result type is the same as the input
-    -- types.
+    -- ^ Binary operation.
 
   | CmpOp CmpOp SubExp SubExp
     -- ^ Comparison - result type is always boolean.
@@ -181,25 +209,20 @@ data BasicOp lore
   | ConvOp ConvOp SubExp
     -- ^ Conversion "casting".
 
-  -- Assertion management.
-  | Assert SubExp SrcLoc
-  -- ^ Turn a boolean into a certificate, halting the
-  -- program if the boolean is false.
+  | Assert SubExp (ErrorMsg SubExp) (SrcLoc, [SrcLoc])
+  -- ^ Turn a boolean into a certificate, halting the program with the
+  -- given error message if the boolean is false.
 
   -- Primitive array operations
 
-  | Index Certificates VName (Slice SubExp)
-  -- ^ 1st arg are (optional) certificates for bounds
-  -- checking.  If given (even as an empty list), no
-  -- run-time bounds checking is done.
+  | Index VName (Slice SubExp)
+  -- ^ The certificates for bounds-checking are part of the 'Stm'.
 
-  | Split Certificates Int [SubExp] VName
-  -- ^ 3rd arg is sizes of arrays you get back, which is
-  -- different from what the external language does.
-  -- In the core language,
-  -- @a = [1,2,3,4]; split@0( (1,0,2) , a ) = {[1], [], [2,3]}@
+  | Update VName (Slice SubExp) SubExp
+  -- ^ An in-place update of the given array at the given position.
+  -- Consumes the array.
 
-  | Concat Certificates Int VName [VName] SubExp
+  | Concat Int VName [VName] SubExp
   -- ^ @concat@0([1],[2, 3, 4]) = [1, 2, 3, 4]@.
 
   | Copy VName
@@ -219,28 +242,31 @@ data BasicOp lore
   | Replicate Shape SubExp
   -- ^ @replicate([3][2],1) = [[1,1], [1,1], [1,1]]@
 
+  | Repeat [Shape] Shape VName
+  -- ^ Repeat each dimension of the input array some number of times,
+  -- given by the corresponding shape.  For an array of rank @k@, the
+  -- list must contain @k@ shapes.  A shape may be empty (in which
+  -- case the dimension is not repeated, but it is still present).
+  -- The last shape indicates the amount of extra innermost
+  -- dimensions.  All other extra dimensions are added *before* the original dimension.
+
   | Scratch PrimType [SubExp]
   -- ^ Create array of given type and shape, with undefined elements.
 
   -- Array index space transformation.
-  | Reshape Certificates (ShapeChange SubExp) VName
+  | Reshape (ShapeChange SubExp) VName
    -- ^ 1st arg is the new shape, 2nd arg is the input array *)
 
-  | Rearrange Certificates [Int] VName
+  | Rearrange [Int] VName
   -- ^ Permute the dimensions of the input array.  The list
   -- of integers is a list of dimensions (0-indexed), which
   -- must be a permutation of @[0,n-1]@, where @n@ is the
   -- number of dimensions in the input array.
 
-  | Rotate Certificates [SubExp] VName
+  | Rotate [SubExp] VName
   -- ^ Rotate the dimensions of the input array.  The list of
   -- subexpressions specify how much each dimension is rotated.  The
   -- length of this list must be equal to the rank of the array.
-
-  | Partition Certificates Int VName [VName]
-    -- ^ First variable is the flag array, second is the element
-    -- arrays.  If no arrays are given, the returned offsets are zero,
-    -- and no arrays are returned.
   deriving (Eq, Ord, Show)
 
 -- | The root Futhark expression type.  The 'Op' constructor contains
@@ -250,11 +276,11 @@ data ExpT lore
   = BasicOp (BasicOp lore)
     -- ^ A simple (non-recursive) operation.
 
-  | Apply  Name [(SubExp, Diet)] (RetType lore)
+  | Apply  Name [(SubExp, Diet)] [RetType lore] (Safety, SrcLoc, [SrcLoc])
 
-  | If     SubExp (BodyT lore) (BodyT lore) [ExtType]
+  | If     SubExp (BodyT lore) (BodyT lore) (IfAttr (BranchType lore))
 
-  | DoLoop [(FParam lore, SubExp)] [(FParam lore, SubExp)] LoopForm (BodyT lore)
+  | DoLoop [(FParam lore, SubExp)] [(FParam lore, SubExp)] (LoopForm lore) (BodyT lore)
     -- ^ @loop {a} = {v} (for i < n|while b) do b@.  The merge
     -- parameters are divided into context and value part.
 
@@ -264,20 +290,45 @@ deriving instance Annotations lore => Eq (ExpT lore)
 deriving instance Annotations lore => Show (ExpT lore)
 deriving instance Annotations lore => Ord (ExpT lore)
 
+-- | Whether something is safe or unsafe (mostly function calls, and
+-- in the context of whether operations are dynamically checked).
+-- When we inline an 'Unsafe' function, we remove all safety checks in
+-- its body.  The 'Ord' instance picks 'Unsafe' as being less than
+-- 'Safe'.
+data Safety = Unsafe | Safe deriving (Eq, Ord, Show)
+
 -- | For-loop or while-loop?
-data LoopForm = ForLoop VName IntType SubExp
-              | WhileLoop VName
-              deriving (Eq, Show, Ord)
+data LoopForm lore = ForLoop VName IntType SubExp [(LParam lore,VName)]
+                   | WhileLoop VName
+
+deriving instance Annotations lore => Eq (LoopForm lore)
+deriving instance Annotations lore => Show (LoopForm lore)
+deriving instance Annotations lore => Ord (LoopForm lore)
+
+-- | Data associated with a branch.
+data IfAttr rt = IfAttr { ifReturns :: [rt]
+                        , ifSort :: IfSort
+                        }
+                 deriving (Eq, Show, Ord)
+
+data IfSort = IfNormal -- ^ An ordinary branch.
+            | IfFallback -- ^ A branch where the "true" case is what
+                         -- we are actually interested in, and the
+                         -- "false" case is only present as a fallback
+                         -- for when the true case cannot be safely
+                         -- evaluated.  the compiler is permitted to
+                         -- optimise away the branch if the true case
+                         -- contains only safe statements.
+            deriving (Eq, Show, Ord)
 
 -- | A type alias for namespace control.
 type Exp = ExpT
 
 -- | Anonymous function for use in a SOAC.
-data LambdaT lore =
-  Lambda { lambdaParams     :: [LParam lore]
-         , lambdaBody       :: BodyT lore
-         , lambdaReturnType :: [Type]
-         }
+data LambdaT lore = Lambda { lambdaParams     :: [LParam lore]
+                           , lambdaBody       :: BodyT lore
+                           , lambdaReturnType :: [Type]
+                           }
 
 deriving instance Annotations lore => Eq (LambdaT lore)
 deriving instance Annotations lore => Show (LambdaT lore)
@@ -285,20 +336,6 @@ deriving instance Annotations lore => Ord (LambdaT lore)
 
 -- | Type alias for namespacing reasons.
 type Lambda = LambdaT
-
--- | Anonymous function for use in a SOAC, with an existential return
--- type.
-data ExtLambdaT lore =
-  ExtLambda { extLambdaParams     :: [LParam lore]
-            , extLambdaBody       :: BodyT lore
-            , extLambdaReturnType :: [ExtType]
-            }
-
-deriving instance Annotations lore => Eq (ExtLambdaT lore)
-deriving instance Annotations lore => Show (ExtLambdaT lore)
-deriving instance Annotations lore => Ord (ExtLambdaT lore)
-
-type ExtLambda = ExtLambdaT
 
 type FParam lore = ParamT (FParamAttr lore)
 
@@ -309,7 +346,7 @@ data FunDefT lore = FunDef { funDefEntryPoint :: Maybe EntryPoint
                              -- ^ Contains a value if this function is
                              -- an entry point.
                            , funDefName :: Name
-                           , funDefRetType :: RetType lore
+                           , funDefRetType :: [RetType lore]
                            , funDefParams :: [FParam lore]
                            , funDefBody :: BodyT lore
                            }

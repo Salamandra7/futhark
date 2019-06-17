@@ -2,15 +2,19 @@
 module Language.Futhark.Parser
   ( parseFuthark
   , parseExp
+  , parseModExp
   , parseType
 
   , parseValue
   , parseValues
 
-  , parseExpIncr
-  , parseExpIncrIO
+  , parseDecOrExpIncrM
 
   , ParseError (..)
+
+  , scanTokensText
+  , L(..)
+  , Token(..)
   )
   where
 
@@ -19,6 +23,7 @@ import qualified Data.Text as T
 import Language.Futhark.Syntax
 import Language.Futhark.Attributes
 import Language.Futhark.Parser.Parser
+import Language.Futhark.Parser.Lexer
 
 -- | Parse an entire Futhark program from the given 'T.Text', using
 -- the 'FilePath' as the source name for error messages.
@@ -31,6 +36,12 @@ parseFuthark = parse prog
 parseExp :: FilePath -> T.Text
          -> Either ParseError UncheckedExp
 parseExp = parse expression
+
+-- | Parse a Futhark module expression from the given 'String', using the
+-- 'FilePath' as the source name for error messages.
+parseModExp :: FilePath -> T.Text
+            -> Either ParseError (ModExpBase NoInfo Name)
+parseModExp = parse modExpression
 
 -- | Parse an Futhark type from the given 'String', using the
 -- 'FilePath' as the source name for error messages.

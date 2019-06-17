@@ -2,8 +2,9 @@
 module Futhark.CodeGen.Backends.GenericPython.Definitions
   ( pyFunctions
   , pyUtility
-  , pyReader
+  , pyValues
   , pyPanic
+  , pyTuning
   ) where
 
 import Data.FileEmbed
@@ -14,8 +15,11 @@ pyFunctions = $(embedStringFile "rts/python/memory.py")
 pyUtility :: String
 pyUtility = $(embedStringFile "rts/python/scalar.py")
 
-pyReader :: String
-pyReader = $(embedStringFile "rts/python/reader.py")
+pyValues :: String
+pyValues = $(embedStringFile "rts/python/values.py")
 
 pyPanic :: String
 pyPanic = $(embedStringFile "rts/python/panic.py")
+
+pyTuning :: String
+pyTuning = $(embedStringFile "rts/python/tuning.py")

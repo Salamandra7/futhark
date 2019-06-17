@@ -1,4 +1,5 @@
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE LambdaCase #-}
 -- | Definitions of primitive types, the values that inhabit these
 -- types, and operations on these values.  A primitive value can also
 -- be called a scalar.
@@ -53,32 +54,41 @@ module Futhark.Representation.Primitive
        , doFCmpLt, doFCmpLe
 
         -- * Type Of
-       , convTypes
        , binOpType
        , unOpType
        , cmpOpType
+       , convOpType
 
-         -- * Utility
+       -- * Primitive functions
+       , primFuns
+
+       -- * Utility
        , zeroIsh
        , oneIsh
+       , negativeIsh
        , primBitSize
        , primByteSize
+       , intByteSize
+       , floatByteSize
        , commutativeBinOp
 
        -- * Prettyprinting
        , convOpFun
+       , prettySigned
        )
        where
 
 import           Control.Applicative
+import           Data.Binary.IEEE754 (floatToWord, wordToFloat, doubleToWord, wordToDouble)
 import           Data.Bits
-import           Data.Hashable
 import           Data.Int            (Int16, Int32, Int64, Int8)
+import qualified Data.Map as M
 import           Data.Word
 
 import           Prelude
 
 import           Futhark.Util.Pretty
+import           Futhark.Util (roundFloat, roundDouble, lgamma, lgammaf, tgamma, tgammaf)
 
 -- | An integer type, ordered by size.  Note that signedness is not a
 -- property of the type, but a property of the operations performed on
@@ -88,9 +98,6 @@ data IntType = Int8
              | Int32
              | Int64
              deriving (Eq, Ord, Show, Enum, Bounded)
-
-instance Hashable IntType where
-  hashWithSalt salt = hashWithSalt salt . fromEnum
 
 instance Pretty IntType where
   ppr Int8  = text "i8"
@@ -106,9 +113,6 @@ allIntTypes = [minBound..maxBound]
 data FloatType = Float32
                | Float64
                deriving (Eq, Ord, Show, Enum, Bounded)
-
-instance Hashable FloatType where
-  hashWithSalt salt = hashWithSalt salt . fromEnum
 
 instance Pretty FloatType where
   ppr Float32 = text "f32"
@@ -147,9 +151,6 @@ instance Enum PrimType where
 instance Bounded PrimType where
   minBound = IntType Int8
   maxBound = Cert
-
-instance Hashable PrimType where
-  hashWithSalt salt = hashWithSalt salt . fromEnum
 
 instance Pretty PrimType where
   ppr (IntType t)   = ppr t
@@ -203,8 +204,16 @@ data FloatValue = Float32Value !Float
 
 
 instance Pretty FloatValue where
-  ppr (Float32Value v) = text $ show v ++ "f32"
-  ppr (Float64Value v) = text $ show v ++ "f64"
+  ppr (Float32Value v)
+    | isInfinite v, v >= 0 = text "f32.inf"
+    | isInfinite v, v <  0 = text "-f32.inf"
+    | isNaN v = text "f32.nan"
+    | otherwise = text $ show v ++ "f32"
+  ppr (Float64Value v)
+    | isInfinite v, v >= 0 = text "f64.inf"
+    | isInfinite v, v <  0 = text "-f64.inf"
+    | isNaN v = text "f64.nan"
+    | otherwise = text $ show v ++ "f64"
 
 -- | Create a 'FloatValue' from a type and a 'Rational'.
 floatValue :: Real num => FloatType -> num -> FloatValue
@@ -335,6 +344,9 @@ data CmpOp = CmpEq PrimType -- ^ All types equality.
            | FCmpLt FloatType -- ^ Floating-point less than.
            | FCmpLe FloatType -- ^ Floating-point less than or equal.
 
+           -- Boolean comparison.
+           | CmpLlt -- ^ Boolean less than.
+           | CmpLle -- ^ Boolean less than or equal.
              deriving (Eq, Ord, Show)
 
 -- | Conversion operators try to generalise the @from t0 x to t1@
@@ -361,6 +373,12 @@ data ConvOp = ZExt IntType IntType
               -- ^ Convert an unsigned integer to a floating-point value.
             | SIToFP IntType FloatType
               -- ^ Convert a signed integer to a floating-point value.
+            | IToB IntType
+              -- ^ Convert an integer to a boolean value.  Zero
+              -- becomes false; anything else is true.
+            | BToI IntType
+              -- ^ Convert a boolean to an integer.  True is converted
+              -- to 1 and False to 0.
              deriving (Eq, Ord, Show)
 
 -- | A list of all unary operators for all types.
@@ -424,6 +442,8 @@ allConvOps = concat [ ZExt <$> allIntTypes <*> allIntTypes
                     , FPToSI <$> allFloatTypes <*> allIntTypes
                     , UIToFP <$> allIntTypes <*> allFloatTypes
                     , SIToFP <$> allIntTypes <*> allFloatTypes
+                    , IToB <$> allIntTypes
+                    , BToI <$> allIntTypes
                     ]
 
 doUnOp :: UnOp -> PrimValue -> Maybe PrimValue
@@ -586,15 +606,15 @@ doUMax v1 v2 = intValue (intValueType v1) $ intToWord64 v1 `max` intToWord64 v2
 
 -- | Left-shift.
 doShl :: IntValue -> IntValue -> IntValue
-doShl v1 v2 = intValue (intValueType v1) $ intToInt64 v1 `shiftL` intToInt v2
+doShl v1 v2 = intValue (intValueType v1) $ intToInt64 v1 `shift` intToInt v2
 
 -- | Logical right-shift, zero-extended.
 doLShr :: IntValue -> IntValue -> IntValue
-doLShr v1 v2 = intValue (intValueType v1) $ intToWord64 v1 `shiftR` intToInt v2
+doLShr v1 v2 = intValue (intValueType v1) $ intToWord64 v1 `shift` negate (intToInt v2)
 
 -- | Arithmetic right-shift, sign-extended.
 doAShr :: IntValue -> IntValue -> IntValue
-doAShr v1 v2 = intValue (intValueType v1) $ intToInt64 v1 `shiftR` intToInt v2
+doAShr v1 v2 = intValue (intValueType v1) $ intToInt64 v1 `shift` negate (intToInt v2)
 
 -- | Bitwise and.
 doAnd :: IntValue -> IntValue -> IntValue
@@ -622,6 +642,8 @@ doConvOp (FPToUI _ to) (FloatValue v) = Just $ IntValue $ doFPToUI v to
 doConvOp (FPToSI _ to) (FloatValue v) = Just $ IntValue $ doFPToSI v to
 doConvOp (UIToFP _ to) (IntValue v)   = Just $ FloatValue $ doUIToFP v to
 doConvOp (SIToFP _ to) (IntValue v)   = Just $ FloatValue $ doSIToFP v to
+doConvOp (IToB _) (IntValue v)        = Just $ BoolValue $ intToInt64 v /= 0
+doConvOp (BToI to) (BoolValue v)      = Just $ IntValue $ intValue to $ if v then 1 else 0::Int
 doConvOp _ _                          = Nothing
 
 -- | Zero-extend the given integer value to the size of the given
@@ -675,6 +697,8 @@ doCmpOp CmpSlt{} (IntValue v1) (IntValue v2)     = Just $ doCmpSlt v1 v2
 doCmpOp CmpSle{} (IntValue v1) (IntValue v2)     = Just $ doCmpSle v1 v2
 doCmpOp FCmpLt{} (FloatValue v1) (FloatValue v2) = Just $ doFCmpLt v1 v2
 doCmpOp FCmpLe{} (FloatValue v1) (FloatValue v2) = Just $ doFCmpLe v1 v2
+doCmpOp CmpLlt{} (BoolValue v1) (BoolValue v2)   = Just $ not v1 && v2
+doCmpOp CmpLle{} (BoolValue v1) (BoolValue v2)   = Just $ not (v1 && not v2)
 doCmpOp _ _ _                                    = Nothing
 
 -- | Compare any two primtive values for exact equality.
@@ -727,16 +751,6 @@ floatToDouble :: FloatValue -> Double
 floatToDouble (Float32Value v) = fromRational $ toRational v
 floatToDouble (Float64Value v) = v
 
--- | Return respectively the source and destination types of a conversion operator.
-convTypes :: ConvOp -> (PrimType, PrimType)
-convTypes (ZExt t1 t2)   = (IntType t1, IntType t2)
-convTypes (SExt t1 t2)   = (IntType t1, IntType t2)
-convTypes (FPConv t1 t2) = (FloatType t1, FloatType t2)
-convTypes (FPToUI t1 t2) = (FloatType t1, IntType t2)
-convTypes (FPToSI t1 t2) = (FloatType t1, IntType t2)
-convTypes (UIToFP t1 t2) = (IntType t1, FloatType t2)
-convTypes (SIToFP t1 t2) = (IntType t1, FloatType t2)
-
 -- | The result type of a binary operator.
 binOpType :: BinOp -> PrimType
 binOpType (Add t)   = IntType t
@@ -778,7 +792,8 @@ cmpOpType (CmpUlt t) = IntType t
 cmpOpType (CmpUle t) = IntType t
 cmpOpType (FCmpLt t) = FloatType t
 cmpOpType (FCmpLe t) = FloatType t
-
+cmpOpType CmpLlt = Bool
+cmpOpType CmpLle = Bool
 
 -- | The operand and result type of a unary operator.
 unOpType :: UnOp -> PrimType
@@ -789,12 +804,113 @@ unOpType (Complement t) = IntType t
 unOpType (Abs t)        = IntType t
 unOpType (FAbs t)       = FloatType t
 
+-- | The input and output types of a conversion operator.
+convOpType :: ConvOp -> (PrimType, PrimType)
+convOpType (ZExt from to) = (IntType from, IntType to)
+convOpType (SExt from to) = (IntType from, IntType to)
+convOpType (FPConv from to) = (FloatType from, FloatType to)
+convOpType (FPToUI from to) = (FloatType from, IntType to)
+convOpType (FPToSI from to) = (FloatType from, IntType to)
+convOpType (UIToFP from to) = (IntType from, FloatType to)
+convOpType (SIToFP from to) = (IntType from, FloatType to)
+convOpType (IToB from) = (IntType from, Bool)
+convOpType (BToI to) = (Bool, IntType to)
+
+-- | A mapping from names of primitive functions to their parameter
+-- types, their result type, and a function for evaluating them.
+primFuns :: M.Map String ([PrimType], PrimType,
+                          [PrimValue] -> Maybe PrimValue)
+primFuns = M.fromList
+  [ f32 "sqrt32" sqrt, f64 "sqrt64" sqrt
+  , f32 "log32" log, f64 "log64" log
+  , f32 "log10_32" (logBase 10), f64 "log10_64" (logBase 10)
+  , f32 "log2_32" (logBase 2), f64 "log2_64" (logBase 2)
+  , f32 "exp32" exp, f64 "exp64" exp
+  , f32 "sin32" sin, f64 "sin64" sin
+  , f32 "cos32" cos, f64 "cos64" cos
+  , f32 "tan32" tan, f64 "tan64" tan
+  , f32 "asin32" asin, f64 "asin64" asin
+  , f32 "acos32" acos, f64 "acos64" acos
+  , f32 "atan32" atan, f64 "atan64" atan
+  , f32 "round32" roundFloat, f64 "round64" roundDouble
+  , f32 "gamma32" tgammaf, f64 "gamma64" tgamma
+  , f32 "lgamma32" lgammaf, f64 "lgamma64" lgamma
+
+  , ("atan2_32",
+     ([FloatType Float32, FloatType Float32], FloatType Float32,
+      \case
+        [FloatValue (Float32Value x), FloatValue (Float32Value y)] ->
+          Just $ FloatValue $ Float32Value $ atan2 x y
+        _ -> Nothing))
+  , ("atan2_64",
+     ([FloatType Float64, FloatType Float64], FloatType Float64,
+       \case
+         [FloatValue (Float64Value x), FloatValue (Float64Value y)] ->
+           Just $ FloatValue $ Float64Value $ atan2 x y
+         _ -> Nothing))
+
+  , ("isinf32",
+     ([FloatType Float32], Bool,
+      \case
+        [FloatValue (Float32Value x)] -> Just $ BoolValue $ isInfinite x
+        _ -> Nothing))
+  , ("isinf64",
+     ([FloatType Float64], Bool,
+      \case
+        [FloatValue (Float64Value x)] -> Just $ BoolValue $ isInfinite x
+        _ -> Nothing))
+
+  , ("isnan32",
+     ([FloatType Float32], Bool,
+      \case
+        [FloatValue (Float32Value x)] -> Just $ BoolValue $ isNaN x
+        _ -> Nothing))
+  , ("isnan64",
+     ([FloatType Float64], Bool,
+      \case
+        [FloatValue (Float64Value x)] -> Just $ BoolValue $ isNaN x
+        _ -> Nothing))
+
+  , ("to_bits32",
+     ([FloatType Float32], IntType Int32,
+      \case
+        [FloatValue (Float32Value x)] ->
+          Just $ IntValue $ Int32Value $ fromIntegral $ floatToWord x
+        _ -> Nothing))
+  , ("to_bits64",
+     ([FloatType Float64], IntType Int64,
+      \case
+        [FloatValue (Float64Value x)] ->
+          Just $ IntValue $ Int64Value $ fromIntegral $ doubleToWord x
+        _ -> Nothing))
+
+  , ("from_bits32",
+     ([IntType Int32], FloatType Float32,
+      \case
+        [IntValue (Int32Value x)] ->
+          Just $ FloatValue $ Float32Value $ wordToFloat $ fromIntegral x
+        _ -> Nothing))
+  , ("from_bits64",
+     ([IntType Int64], FloatType Float64,
+      \case
+        [IntValue (Int64Value x)] ->
+          Just $ FloatValue $ Float64Value $ wordToDouble $ fromIntegral x
+        _ -> Nothing))
+  ]
+  where f32 s f = (s, ([FloatType Float32], FloatType Float32, f32PrimFun f))
+        f64 s f = (s, ([FloatType Float64], FloatType Float64, f64PrimFun f))
+
+        f32PrimFun f [FloatValue (Float32Value x)] =
+          Just $ FloatValue $ Float32Value $ f x
+        f32PrimFun _ _ = Nothing
+
+        f64PrimFun f [FloatValue (Float64Value x)] =
+          Just $ FloatValue $ Float64Value $ f x
+        f64PrimFun _ _ = Nothing
+
 -- | Is the given value kind of zero?
 zeroIsh :: PrimValue -> Bool
-zeroIsh (IntValue (Int8Value k))      = k == 0
-zeroIsh (IntValue (Int16Value k))     = k == 0
-zeroIsh (IntValue (Int32Value k))     = k == 0
-zeroIsh (IntValue (Int64Value k))     = k == 0
+zeroIsh (IntValue k)                  = zeroIshInt k
 zeroIsh (FloatValue (Float32Value k)) = k == 0
 zeroIsh (FloatValue (Float64Value k)) = k == 0
 zeroIsh (BoolValue False)             = True
@@ -810,6 +926,14 @@ oneIsh (FloatValue (Float32Value k)) = k == 1
 oneIsh (FloatValue (Float64Value k)) = k == 1
 oneIsh (BoolValue True)              = True
 oneIsh _                             = False
+
+-- | Is the given value kind of negative?
+negativeIsh :: PrimValue -> Bool
+negativeIsh (IntValue k)                  = negativeIshInt k
+negativeIsh (FloatValue (Float32Value k)) = k < 0
+negativeIsh (FloatValue (Float64Value k)) = k < 0
+negativeIsh (BoolValue _)                 = False
+negativeIsh Checked                       = False
 
 -- | Is the given integer value kind of zero?
 zeroIshInt :: IntValue -> Bool
@@ -908,10 +1032,12 @@ instance Pretty CmpOp where
   ppr (CmpSle t) = taggedI "sle" t
   ppr (FCmpLt t) = taggedF "lt" t
   ppr (FCmpLe t) = taggedF "le" t
+  ppr CmpLlt = text "llt"
+  ppr CmpLle = text "lle"
 
 instance Pretty ConvOp where
   ppr op = convOp (convOpFun op) from to
-    where (from, to) = convTypes op
+    where (from, to) = convOpType op
 
 instance Pretty UnOp where
   ppr Not            = text "!"
@@ -919,7 +1045,7 @@ instance Pretty UnOp where
   ppr (FAbs t)       = taggedF "fabs" t
   ppr (SSignum t)    = taggedI "ssignum" t
   ppr (USignum t)    = taggedI "usignum" t
-  ppr (Complement t) = taggedI "~" t
+  ppr (Complement t) = taggedI "complement" t
 
 convOpFun :: ConvOp -> String
 convOpFun ZExt{}   = "zext"
@@ -929,6 +1055,8 @@ convOpFun FPToUI{} = "fptoui"
 convOpFun FPToSI{} = "fptosi"
 convOpFun UIToFP{} = "uitofp"
 convOpFun SIToFP{} = "sitofp"
+convOpFun IToB{} = "itob"
+convOpFun BToI{} = "btoi"
 
 taggedI :: String -> IntType -> Doc
 taggedI s Int8  = text $ s ++ "8"
@@ -942,3 +1070,8 @@ taggedF s Float64 = text $ s ++ "64"
 
 convOp :: (Pretty from, Pretty to) => String -> from -> to -> Doc
 convOp s from to = text s <> text "_" <> ppr from <> text "_" <> ppr to
+
+-- | True if signed.  Only makes a difference for integer types.
+prettySigned :: Bool -> PrimType -> String
+prettySigned True (IntType it) = 'u' : drop 1 (pretty it)
+prettySigned _ t = pretty t

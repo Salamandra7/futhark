@@ -22,31 +22,28 @@ module Futhark.Transform.Rename
   , renameBody
   , renameLambda
   , renameFun
+  , renamePattern
   -- * Renaming annotations
   , RenameM
   , substituteRename
   , bindingForRename
+  , renamingStms
   , Rename (..)
   , Renameable
   )
   where
 
-import Control.Applicative
 import Control.Monad.State
 import Control.Monad.Reader
-
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Data.Maybe
-
-import Prelude
 
 import Futhark.Representation.AST.Syntax
 import Futhark.Representation.AST.Traversals
 import Futhark.Representation.AST.Attributes.Patterns
 import Futhark.FreshNames
-import Futhark.MonadFreshNames (MonadFreshNames(..),
-                                modifyNameSource)
+import Futhark.MonadFreshNames (MonadFreshNames(..), modifyNameSource)
 import Futhark.Transform.Substitute
 
 runRenamer :: RenameM a -> VNameSource -> (a, VNameSource)
@@ -77,8 +74,8 @@ renameExp = modifyNameSource . runRenamer . rename
 renameStm :: (Renameable lore, MonadFreshNames m) =>
              Stm lore -> m (Stm lore)
 renameStm binding = do
-  e <- renameExp $ bindingExp binding
-  return binding { bindingExp = e }
+  e <- renameExp $ stmExp binding
+  return binding { stmExp = e }
 
 -- | Rename bound variables such that each is unique.  The semantics
 -- of the body is unaffected, under the assumption that the body was
@@ -102,6 +99,13 @@ renameLambda = modifyNameSource . runRenamer . rename
 renameFun :: (Renameable lore, MonadFreshNames m) =>
              FunDef lore -> m (FunDef lore)
 renameFun = modifyNameSource . runRenamer . rename
+
+-- | Produce an equivalent pattern but with each pattern element given
+-- a new name.
+renamePattern :: (Rename attr, MonadFreshNames m) =>
+                 PatternT attr -> m (PatternT attr)
+renamePattern = modifyNameSource . runRenamer . rename'
+  where rename' pat = bind (patternNames pat) $ rename pat
 
 data RenameEnv = RenameEnv {
     envNameMap :: M.Map VName VName
@@ -180,6 +184,16 @@ bind vars body = do
   where bind' vars' env = env { envNameMap = M.fromList (zip vars vars')
                                              `M.union` envNameMap env }
 
+-- | Rename some statements, then execute an action with the name
+-- substitutions induced by the statements active.
+renamingStms :: Renameable lore => Stms lore -> (Stms lore -> RenameM a) -> RenameM a
+renamingStms stms m = descend mempty stms
+  where descend stms' rem_stms = case stmsHead rem_stms of
+          Nothing -> m stms'
+          Just (stm, rem_stms') -> bind (patternNames $ stmPattern stm) $ do
+            stm' <- rename stm
+            descend (stms' <> oneStm stm') rem_stms'
+
 instance Renameable lore => Rename (FunDef lore) where
   rename (FunDef entry fname ret params body) =
     bind (map paramName params) $ do
@@ -199,26 +213,20 @@ instance Rename attr => Rename (PatternT attr) where
   rename (Pattern context values) = Pattern <$> rename context <*> rename values
 
 instance Rename attr => Rename (PatElemT attr) where
-  rename (PatElem ident bindage attr) =
-    PatElem <$> rename ident <*> rename bindage <*> rename attr
+  rename (PatElem ident attr) = PatElem <$> rename ident <*> rename attr
 
-instance Rename Bindage where
-  rename BindVar =
-    return BindVar
-  rename (BindInPlace cs src is) =
-    BindInPlace <$>
-    mapM rename cs <*>
-    rename src <*>
-    mapM rename is
+instance Rename Certificates where
+  rename (Certificates cs) = Certificates <$> rename cs
+
+instance Rename attr => Rename (StmAux attr) where
+  rename (StmAux cs attr) =
+    StmAux <$> rename cs <*> rename attr
 
 instance Renameable lore => Rename (Body lore) where
-  rename (Body lore [] res) =
-    Body <$> rename lore <*> pure [] <*> rename res
-  rename (Body blore (bnd:bnds) res) =
-    bind (patternNames $ bindingPattern bnd) $ do
-      bnd' <- rename bnd
-      Body blore' bnds' res' <- rename $ Body blore bnds res
-      return $ Body blore' (bnd':bnds') res'
+  rename (Body attr stms res) = do
+    attr' <- rename attr
+    renamingStms stms $ \stms' ->
+      Body attr' stms' <$> rename res
 
 instance Renameable lore => Rename (Stm lore) where
   rename (Let pat elore e) = Let <$> rename pat <*> rename elore <*> rename e
@@ -230,17 +238,22 @@ instance Renameable lore => Rename (Exp lore) where
     ctxinit' <- mapM rename ctxinit
     valinit' <- mapM rename valinit
     case form of
-      ForLoop loopvar it boundexp -> do
+      ForLoop loopvar it boundexp loop_vars -> do
+        let (loop_params, loop_arrs) = unzip loop_vars
         boundexp' <- rename boundexp
-        bind (map paramName $ ctxparams++valparams) $ do
+        loop_arrs' <- rename loop_arrs
+        bind (map paramName (ctxparams++valparams) ++
+              map paramName loop_params) $ do
           ctxparams' <- mapM rename ctxparams
           valparams' <- mapM rename valparams
+          loop_params' <- mapM rename loop_params
           bind [loopvar] $ do
             loopvar'  <- rename loopvar
             loopbody' <- rename loopbody
             return $ DoLoop
               (zip ctxparams' ctxinit') (zip valparams' valinit')
-              (ForLoop loopvar' it boundexp') loopbody'
+              (ForLoop loopvar' it boundexp' $
+               zip loop_params' loop_arrs') loopbody'
       WhileLoop cond ->
         bind (map paramName $ ctxparams++valparams) $ do
           ctxparams' <- mapM rename ctxparams
@@ -255,9 +268,10 @@ instance Renameable lore => Rename (Exp lore) where
                       mapOnBody = const rename
                     , mapOnSubExp = rename
                     , mapOnVName = rename
-                    , mapOnCertificates = mapM rename
                     , mapOnRetType = rename
+                    , mapOnBranchType = rename
                     , mapOnFParam = rename
+                    , mapOnLParam = rename
                     , mapOnOp = rename
                     }
 
@@ -267,7 +281,7 @@ instance Rename shape =>
     size' <- rename size
     return $ Array et size' u
   rename (Prim et) = return $ Prim et
-  rename (Mem e space) = Mem <$> rename e <*> pure space
+  rename (Mem space) = pure $ Mem space
 
 instance Renameable lore => Rename (Lambda lore) where
   rename (Lambda params body ret) =
@@ -277,35 +291,21 @@ instance Renameable lore => Rename (Lambda lore) where
       ret' <- mapM rename ret
       return $ Lambda params' body' ret'
 
-instance Renameable lore => Rename (ExtLambda lore) where
-  rename (ExtLambda params body rettype) =
-    bind (map paramName params) $ do
-      params' <- mapM rename params
-      body' <- rename body
-      rettype' <- rename rettype
-      return $ ExtLambda params' body' rettype'
-
 instance Rename Names where
   rename = fmap S.fromList . mapM rename . S.toList
 
 instance Rename Rank where
   rename = return
 
-instance Rename Shape where
+instance Rename d => Rename (ShapeBase d) where
   rename (Shape l) = Shape <$> mapM rename l
 
-instance Rename ExtShape where
-  rename (ExtShape l) = ExtShape <$> mapM rename l
-
-instance Rename ExtDimSize where
+instance Rename ExtSize where
   rename (Free se) = Free <$> rename se
   rename (Ext x)   = return $ Ext x
 
 instance Rename () where
   rename = return
-
-instance Rename ExtRetType where
-  rename = fmap ExtRetType . mapM rename . retTypeValues
 
 instance Rename d => Rename (DimIndex d) where
   rename (DimFix i)       = DimFix <$> rename i
@@ -318,4 +318,5 @@ type Renameable lore = (Rename (LetAttr lore),
                         Rename (FParamAttr lore),
                         Rename (LParamAttr lore),
                         Rename (RetType lore),
+                        Rename (BranchType lore),
                         Rename (Op lore))

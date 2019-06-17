@@ -4,9 +4,7 @@
 -- array).
 --
 -- ==
--- structure distributed { Kernel 4 }
-
-default(f32)
+-- structure distributed { SegRed 2 }
 
 let max(a: f32) (b: f32): f32 = if(a < b) then b else a
 

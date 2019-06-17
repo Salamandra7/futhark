@@ -5,19 +5,14 @@ module Futhark.Analysis.Range
        , RangeM
        , analyseExp
        , analyseLambda
-       , analyseExtLambda
        , analyseBody
        , analyseStms
        )
        where
 
-import Control.Applicative
 import qualified Data.Map.Strict as M
 import Control.Monad.Reader
-import Data.Maybe
 import Data.List
-
-import Prelude
 
 import qualified Futhark.Analysis.ScalExp as SE
 import Futhark.Representation.Ranges
@@ -36,9 +31,8 @@ rangeAnalysis = Prog . map analyseFun . progFunctions
 analyseFun :: (Attributes lore, CanBeRanged (Op lore)) =>
               FunDef lore -> FunDef (Ranges lore)
 analyseFun (FunDef entry fname restype params body) =
-  runRangeM $ bindFunParams params $ do
-    body' <- analyseBody body
-    return $ FunDef entry fname restype params body'
+  runRangeM $ bindFunParams params $
+  FunDef entry fname restype params <$> analyseBody body
 
 analyseBody :: (Attributes lore, CanBeRanged (Op lore)) =>
                Body lore
@@ -48,16 +42,16 @@ analyseBody (Body lore origbnds result) =
     return $ mkRangedBody lore bnds' result
 
 analyseStms :: (Attributes lore, CanBeRanged (Op lore)) =>
-               [Stm lore]
-            -> ([Stm (Ranges lore)] -> RangeM a)
+               Stms lore
+            -> (Stms (Ranges lore) -> RangeM a)
             -> RangeM a
-analyseStms = analyseStms' []
+analyseStms = analyseStms' mempty . stmsToList
   where analyseStms' acc [] m =
-          m $ reverse acc
+          m acc
         analyseStms' acc (bnd:bnds) m = do
           bnd' <- analyseStm bnd
-          bindPattern (bindingPattern bnd') $
-            analyseStms' (bnd':acc) bnds m
+          bindPattern (stmPattern bnd') $
+            analyseStms' (acc <> oneStm bnd') bnds m
 
 analyseStm :: (Attributes lore, CanBeRanged (Op lore)) =>
               Stm lore -> RangeM (Stm (Ranges lore))
@@ -72,13 +66,14 @@ analyseExp :: (Attributes lore, CanBeRanged (Op lore)) =>
 analyseExp = mapExpM analyse
   where analyse =
           Mapper { mapOnSubExp = return
-                    , mapOnCertificates = return
-                    , mapOnVName = return
-                    , mapOnBody = const analyseBody
-                    , mapOnRetType = return
-                    , mapOnFParam = return
-                    , mapOnOp = return . addOpRanges
-                    }
+                 , mapOnVName = return
+                 , mapOnBody = const analyseBody
+                 , mapOnRetType = return
+                 , mapOnBranchType = return
+                 , mapOnFParam = return
+                 , mapOnLParam = return
+                 , mapOnOp = return . addOpRanges
+                 }
 
 analyseLambda :: (Attributes lore, CanBeRanged (Op lore)) =>
                  Lambda lore
@@ -87,15 +82,6 @@ analyseLambda lam = do
   body <- analyseBody $ lambdaBody lam
   return $ lam { lambdaBody = body
                , lambdaParams = lambdaParams lam
-               }
-
-analyseExtLambda :: (Attributes lore, CanBeRanged (Op lore)) =>
-                    ExtLambda lore
-                 -> RangeM (ExtLambda (Ranges lore))
-analyseExtLambda lam = do
-  body <- analyseBody $ extLambdaBody lam
-  return $ lam { extLambdaBody = body
-               , extLambdaParams = extLambdaParams lam
                }
 
 -- Monad and utility definitions
@@ -221,6 +207,6 @@ betterUpperBound bound =
 -- range.  We just put a zero because I don't think it's used for
 -- anything in this case.
 rangesRep :: RangeM AS.RangesRep
-rangesRep = M.map addLeadingZero <$> ask
+rangesRep = asks $ M.map addLeadingZero
   where addLeadingZero (x,y) =
           (0, boundToScalExp =<< x, boundToScalExp =<< y)

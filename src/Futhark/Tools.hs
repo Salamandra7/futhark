@@ -6,46 +6,36 @@ module Futhark.Tools
 
   , nonuniqueParams
   , redomapToMapAndReduce
+  , scanomapToMapAndScan
+  , dissectScrema
   , sequentialStreamWholeArray
-  , singletonChunkRedLikeStreamLambda
-  , extLambdaToLambda
+
   , partitionChunkedFoldParameters
   , partitionChunkedKernelLambdaParameters
   , partitionChunkedKernelFoldParameters
-
-  , intraproceduralTransformation
 
   -- * Primitive expressions
   , module Futhark.Analysis.PrimExp.Convert
   )
 where
 
-import Control.Applicative
 import Control.Monad.Identity
-import Control.Monad.State
-import Control.Parallel.Strategies
-import Data.Monoid
-import qualified Data.Map.Strict as M
-
-import Prelude
 
 import Futhark.Representation.AST
 import Futhark.Representation.SOACS.SOAC
 import Futhark.MonadFreshNames
 import Futhark.Construct
 import Futhark.Analysis.PrimExp.Convert
+import Futhark.Util
 
-nonuniqueParams :: (MonadFreshNames m, Bindable lore) =>
-                   [LParam lore] -> m ([LParam lore], [Stm lore])
-nonuniqueParams params =
-  modifyNameSource $ runState $ fmap fst $ runBinderEmptyEnv $
-  collectStms $ forM params $ \param ->
+nonuniqueParams :: (MonadFreshNames m, Bindable lore, HasScope lore m, BinderOps lore) =>
+                   [LParam lore] -> m ([LParam lore], Stms lore)
+nonuniqueParams params = runBinder $ forM params $ \param ->
     if not $ primType $ paramType param then do
       param_name <- newVName $ baseString (paramName param) ++ "_nonunique"
       let param' = Param param_name $ paramType param
       localScope (scopeOfLParams [param']) $
-        letBindNames_ [(paramName param,BindVar)] $
-        BasicOp $ Copy $ paramName param'
+        letBindNames_ [paramName param] $ BasicOp $ Copy $ paramName param'
       return param'
     else
       return param
@@ -54,128 +44,126 @@ nonuniqueParams params =
 -- @map@ binding and a @reduce@ binding (returned in that order).
 --
 -- Reuses the original pattern for the @reduce@, and creates a new
--- pattern with new 'Ident's for the result of the @map@. Does /not/
--- add the new idents to the 'Scope'.
+-- pattern with new 'Ident's for the result of the @map@.
 --
 -- Only handles a 'Pattern' with an empty 'patternContextElements'
-redomapToMapAndReduce :: (MonadFreshNames m, Bindable lore, Op lore ~ SOAC lore) =>
-                         Pattern lore -> ExpAttr lore
-                      -> ( Certificates, SubExp
+redomapToMapAndReduce :: (MonadFreshNames m, Bindable lore,
+                          ExpAttr lore ~ (), Op lore ~ SOAC lore) =>
+                         Pattern lore
+                      -> ( SubExp
                          , Commutativity
                          , LambdaT lore, LambdaT lore, [SubExp]
                          , [VName])
                       -> m (Stm lore, Stm lore)
-redomapToMapAndReduce (Pattern [] patelems) lore
-                      (certs, outersz, comm, redlam, redmap_lam, accs, arrs) = do
+redomapToMapAndReduce (Pattern [] patelems)
+                      (w, comm, redlam, map_lam, accs, arrs) = do
+  (map_pat, red_pat, red_args) <-
+    splitScanOrRedomap patelems w map_lam accs
+  let map_bnd = mkLet [] map_pat $ Op $ Screma w (mapSOAC map_lam) arrs
+      (nes, red_arrs) = unzip red_args
+  red_bnd <- Let red_pat (defAux ()) . Op <$>
+             (Screma w <$> reduceSOAC [Reduce comm redlam nes] <*> pure red_arrs)
+  return (map_bnd, red_bnd)
+redomapToMapAndReduce _ _ =
+  error "redomapToMapAndReduce does not handle a non-empty 'patternContextElements'"
+
+-- | Like 'redomapToMapAndReduce', but for 'Scanomap'.
+scanomapToMapAndScan :: (MonadFreshNames m, Bindable lore,
+                          ExpAttr lore ~ (), Op lore ~ SOAC lore) =>
+                        Pattern lore
+                     -> ( SubExp
+                        , LambdaT lore, LambdaT lore, [SubExp]
+                        , [VName])
+                     -> m (Stm lore, Stm lore)
+scanomapToMapAndScan (Pattern [] patelems) (w, scanlam, map_lam, accs, arrs) = do
+  (map_pat, scan_pat, scan_args) <-
+    splitScanOrRedomap patelems w map_lam accs
+  let map_bnd = mkLet [] map_pat $ Op $ Screma w (mapSOAC map_lam) arrs
+      (nes, scan_arrs) = unzip scan_args
+  scan_bnd <- Let scan_pat (defAux ()) . Op <$>
+              (Screma w <$> scanSOAC scanlam nes <*> pure scan_arrs)
+  return (map_bnd, scan_bnd)
+scanomapToMapAndScan _ _ =
+  error "scanomapToMapAndScan does not handle a non-empty 'patternContextElements'"
+
+splitScanOrRedomap :: (Typed attr, MonadFreshNames m) =>
+                      [PatElemT attr]
+                   -> SubExp -> LambdaT lore -> [SubExp]
+                   -> m ([Ident], PatternT attr, [(SubExp, VName)])
+splitScanOrRedomap patelems w map_lam accs = do
   let (acc_patelems, arr_patelems) = splitAt (length accs) patelems
-  map_accpat <- mapM accMapPatElem acc_patelems
+      (acc_ts, _arr_ts) = splitAt (length accs) $ lambdaReturnType map_lam
+  map_accpat <- zipWithM accMapPatElem acc_patelems acc_ts
   map_arrpat <- mapM arrMapPatElem arr_patelems
   let map_pat = map_accpat ++ map_arrpat
-      map_bnd = mkLet [] map_pat $
-                Op $ Map certs outersz newmap_lam arrs
-      red_args = zip accs $ map (identName . fst) map_accpat
-      red_bnd = Let (Pattern [] acc_patelems) lore $
-                Op $ Reduce certs outersz comm redlam red_args
-  return (map_bnd, red_bnd)
+      red_args = zip accs $ map identName map_accpat
+  return (map_pat, Pattern [] acc_patelems, red_args)
   where
-    accMapPatElem pe = do
-      let (Ident vn tp) = patElemIdent pe
-      let tp' = arrayOfRow tp outersz
-      i <- newIdent (baseString vn ++ "_map_acc") tp'
-      return (i, patElemBindage pe)
-    arrMapPatElem pe =
-      return (patElemIdent pe, patElemBindage pe)
+    accMapPatElem pe acc_t =
+      newIdent (baseString (patElemName pe) ++ "_map_acc") $ acc_t `arrayOfRow` w
+    arrMapPatElem = return . patElemIdent
 
-    newmap_lam =
-      let tobnd = take (length accs) $ map paramIdent $ lambdaParams redmap_lam
-          params' = drop (length accs) $ lambdaParams redmap_lam
-          bndaccs = zipWith (\i acc -> mkLet' []  [i] (BasicOp $ SubExp acc))
-                            tobnd accs
-          body = lambdaBody redmap_lam
-          bnds' = bndaccs ++ bodyStms body
-          body' = body {bodyStms = bnds'}
-      in redmap_lam { lambdaBody = body', lambdaParams = params' }
-redomapToMapAndReduce _ _ _ =
-  error "redomapToMapAndReduce does not handle an empty 'patternContextElements'"
+-- | Turn a Screma into simpler Scremas that are all simple scans,
+-- reduces, and maps.  This is used to handle Scremas that are so
+-- complicated that we cannot directly generate efficient parallel
+-- code for them.  In essense, what happens is the opposite of
+-- horisontal fusion.
+dissectScrema :: (MonadBinder m, Op (Lore m) ~ SOAC (Lore m),
+                    Bindable (Lore m)) =>
+                   Pattern (Lore m) -> SubExp -> ScremaForm (Lore m) -> [VName]
+                -> m ()
+dissectScrema pat w (ScremaForm (scan_lam, scan_nes) reds map_lam) arrs = do
+  let num_reds = redResults reds
+      (scan_res, red_res, map_res) =
+        splitAt3 (length scan_nes) num_reds $ patternNames pat
+  -- First we perform the Map, then we perform the Reduce, and finally
+  -- the Scan.
+  to_scan <- replicateM (length scan_nes) $ newVName "to_scan"
+  to_red <- replicateM num_reds $ newVName "to_red"
+  letBindNames_ (to_scan <> to_red <> map_res) $ Op $ Screma w (mapSOAC map_lam) arrs
 
-sequentialStreamWholeArrayStms :: Bindable lore =>
-                                  SubExp -> [SubExp]
-                               -> ExtLambdaT lore -> [VName]
-                               -> ([Stm lore], [SubExp])
-sequentialStreamWholeArrayStms width accs lam arrs =
-  let (chunk_param, acc_params, arr_params) =
-        partitionChunkedFoldParameters (length accs) $ extLambdaParams lam
-      chunk_bnd = mkLet' [] [paramIdent chunk_param] $ BasicOp $ SubExp width
-      acc_bnds = [ mkLet' [] [paramIdent acc_param] $ BasicOp $ SubExp acc
-                 | (acc_param, acc) <- zip acc_params accs ]
-      arr_bnds = [ mkLet' [] [paramIdent arr_param] $
-                   BasicOp $ Reshape [] (map DimCoercion $ arrayDims $ paramType arr_param) arr
-                 | (arr_param, arr) <- zip arr_params arrs ]
+  reduce <- reduceSOAC reds
+  letBindNames_ red_res $ Op $ Screma w reduce to_red
 
-  in (chunk_bnd :
-      acc_bnds ++
-      arr_bnds ++
-      bodyStms (extLambdaBody lam),
-
-      bodyResult $ extLambdaBody lam)
+  scan <- scanSOAC scan_lam scan_nes
+  letBindNames_ scan_res $ Op $ Screma w scan to_scan
 
 sequentialStreamWholeArray :: (MonadBinder m, Bindable (Lore m)) =>
                               Pattern (Lore m)
-                           -> Certificates
                            -> SubExp -> [SubExp]
-                           -> ExtLambdaT (Lore m) -> [VName]
+                           -> LambdaT (Lore m) -> [VName]
                            -> m ()
-sequentialStreamWholeArray pat cs width nes fun arrs = do
-  let (body_bnds,res) = sequentialStreamWholeArrayStms width nes fun arrs
-      reshapeRes t (Var v)
-        | null (arrayDims t) = BasicOp $ SubExp $ Var v
-        | otherwise          = shapeCoerce cs (arrayDims t) v
-      reshapeRes _ se        = BasicOp $ SubExp se
-      res_bnds =
-        [ mkLet' [] [ident] $ reshapeRes (identType ident) se
-        | (ident,se) <- zip (patternValueIdents pat) res]
+sequentialStreamWholeArray pat w nes lam arrs = do
+  -- We just set the chunksize to w and inline the lambda body.  There
+  -- is no difference between parallel and sequential streams here.
+  let (chunk_size_param, fold_params, arr_params) =
+        partitionChunkedFoldParameters (length nes) $ lambdaParams lam
 
-  mapM_ addStm body_bnds
-  shapemap <- shapeMapping (patternValueTypes pat) <$> mapM subExpType res
-  forM_ (M.toList shapemap) $ \(name,se) ->
-    when (name `elem` patternContextNames pat) $
-      addStm =<< mkLetNames' [name] (BasicOp $ SubExp se)
-  mapM_ addStm res_bnds
+  -- The chunk size is the full size of the array.
+  letBindNames_ [paramName chunk_size_param] $ BasicOp $ SubExp w
 
-singletonChunkRedLikeStreamLambda :: (Bindable lore, MonadFreshNames m) =>
-                                     [Type] -> ExtLambda lore -> m (Lambda lore)
-singletonChunkRedLikeStreamLambda acc_ts lam = do
-  -- The accumulator params are OK, but we need array params without
-  -- the chunk part.
-  let (chunk_param, acc_params, arr_params) =
-        partitionChunkedFoldParameters (length acc_ts) $ extLambdaParams lam
-  unchunked_arr_params <- forM arr_params $ \arr_param ->
-    Param <$>
-    newVName (baseString (paramName arr_param) <> "_unchunked") <*>
-    pure (rowType $ paramType arr_param)
-  let chunk_name = paramName chunk_param
-      chunk_bnd = mkLet' [] [paramIdent chunk_param] $
-                  BasicOp $ SubExp $ intConst Int32 1
-      arr_bnds = [ mkLet' [] [paramIdent arr_param] $
-                   BasicOp $ Replicate (Shape [Var chunk_name]) $
-                   Var $ paramName unchunked_arr_param |
-                   (arr_param, unchunked_arr_param) <-
-                     zip arr_params unchunked_arr_params ]
-      unchunked_body = insertStms (chunk_bnd:arr_bnds) $ extLambdaBody lam
-  return Lambda { lambdaBody = unchunked_body
-                , lambdaParams = acc_params <> unchunked_arr_params
-                , lambdaReturnType = acc_ts
-                }
+  -- The accumulator parameters are initialised to the neutral element.
+  forM_ (zip fold_params nes) $ \(p, ne) ->
+    letBindNames [paramName p] $ BasicOp $ SubExp ne
 
--- | Convert an 'ExtLambda' to a 'Lambda' if the return type is
--- non-existential anyway.
-extLambdaToLambda :: ExtLambda lore -> Maybe (Lambda lore)
-extLambdaToLambda lam = do
-  ret <- hasStaticShapes $ extLambdaReturnType lam
-  return Lambda { lambdaReturnType = ret
-                , lambdaBody = extLambdaBody lam
-                , lambdaParams = extLambdaParams lam
-                }
+  -- Finally, the array parameters are set to the arrays (but reshaped
+  -- to make the types work out; this will be simplified rapidly).
+  forM_ (zip arr_params arrs) $ \(p, arr) ->
+    letBindNames [paramName p] $ BasicOp $
+      Reshape (map DimCoercion $ arrayDims $ paramType p) arr
+
+  -- Then we just inline the lambda body.
+  mapM_ addStm $ bodyStms $ lambdaBody lam
+
+  -- The number of results in the body matches exactly the size (and
+  -- order) of 'pat', so we bind them up here, again with a reshape to
+  -- make the types work out.
+  forM_ (zip (patternElements pat) $ bodyResult $ lambdaBody lam) $ \(pe, se) ->
+    case (arrayDims $ patElemType pe, se) of
+      (dims, Var v)
+        | not $ null dims ->
+            letBindNames_ [patElemName pe] $ BasicOp $ Reshape (map DimCoercion dims) v
+      _ -> letBindNames_ [patElemName pe] $ BasicOp $ SubExp se
 
 partitionChunkedFoldParameters :: Int -> [Param attr]
                                -> (Param attr, [Param attr], [Param attr])
@@ -199,12 +187,3 @@ partitionChunkedKernelLambdaParameters (i_param : chunk_param : params) =
   (paramName i_param, chunk_param, params)
 partitionChunkedKernelLambdaParameters _ =
   error "partitionChunkedKernelLambdaParameters: lambda takes too few parameters"
-
-intraproceduralTransformation :: MonadFreshNames m =>
-                                 (FunDef fromlore -> State VNameSource (FunDef tolore))
-                              -> Prog fromlore -> m (Prog tolore)
-intraproceduralTransformation ft prog =
-  modifyNameSource $ \src ->
-  let (funs, srcs) = unzip $ parMap rseq (onFunction src) (progFunctions prog)
-  in (Prog funs, mconcat srcs)
-  where onFunction src f = runState (ft f) src

@@ -18,9 +18,9 @@
 --     [12, 12, 12]]]
 -- }
 let addRows (xs: []i32, ys: []i32): []i32 =
-  map (+) xs ys
+  map2 (+) xs ys
 
-let main (xsss: [][][]i32, ys: []i32): [][][]i32 =
+let main (xsss: [][][]i32) (ys: []i32): [][][]i32 =
   map  (\(xss: [][]i32): [][]i32  ->
          map (\(xs: []i32): []i32  -> addRows(xs,ys)) xss
       ) xsss

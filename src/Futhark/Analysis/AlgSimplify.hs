@@ -1,8 +1,8 @@
-{-# LANGUAGE TypeSynonymInstances, FlexibleInstances #-}
+{-# LANGUAGE TypeSynonymInstances, FlexibleInstances, LambdaCase #-}
 module Futhark.Analysis.AlgSimplify
   ( ScalExp
-  , simplify
   , Error
+  , simplify
   , mkSuffConds
   , RangesRep
   , ppRangesRep
@@ -11,16 +11,12 @@ module Futhark.Analysis.AlgSimplify
   )
   where
 
-import Control.Applicative
-
 import qualified Data.Set as S
 import qualified Data.Map.Strict as M
 import Data.List
 import Control.Monad
 import Control.Monad.Reader
-import Data.Monoid
-
-import Prelude
+import Control.Monad.State
 
 import Futhark.Representation.AST hiding (SDiv, SMod, SQuot, SRem, SSignum)
 import Futhark.Analysis.ScalExp
@@ -46,20 +42,34 @@ ppRangesRep = unlines . sort . map ppRange . M.toList
 --   a list of variable-to-range bindings.
 data AlgSimplifyEnv = AlgSimplifyEnv { inSolveLTH0 :: Bool
                                      , ranges :: RangesRep
+                                     , maxSteps :: Int
+                                     -- ^ The number of
+                                     -- simplifications to do before
+                                     -- bailing out, to avoid spending
+                                     -- too much time.
                                      }
 
-type Error = String
+data Error = StepsExceeded | Error String
 
-type AlgSimplifyM = ReaderT AlgSimplifyEnv (Either Error)
+type AlgSimplifyM = StateT Int (ReaderT AlgSimplifyEnv (Either Error))
 
 runAlgSimplifier :: Bool -> AlgSimplifyM a -> RangesRep -> Either Error a
-runAlgSimplifier s x r = runReaderT x env
+runAlgSimplifier s x r = runReaderT (evalStateT x 0) env
   where env = AlgSimplifyEnv { inSolveLTH0 = s
                              , ranges = r
+                             , maxSteps = 100 -- heuristically chosen
                              }
 
+step :: AlgSimplifyM ()
+step = do modify (1+)
+          exceeded <- pure (>) <*> get <*> asks maxSteps
+          when exceeded stepsExceeded
+
+stepsExceeded :: AlgSimplifyM a
+stepsExceeded = lift $ lift $ Left StepsExceeded
+
 badAlgSimplifyM :: String -> AlgSimplifyM a
-badAlgSimplifyM = lift . Left
+badAlgSimplifyM = lift . lift . Left . Error
 
 -- | Binds an array name to the set of used-array vars
 markInSolve :: AlgSimplifyEnv -> AlgSimplifyEnv
@@ -99,8 +109,10 @@ type DNF     = [NAnd ]
 -- | Applies Simplification at Expression level:
 simplify :: ScalExp -> RangesRep -> ScalExp
 simplify e rangesrep = case runAlgSimplifier False (simplifyScal e) rangesrep of
-  Left err -> error $ "Error during algebraic simplification of: " ++ pretty e ++
-              "\n"  ++ err
+  Left (Error err) ->
+    error $ "Error during algebraic simplification of: " ++ pretty e ++
+    "\n"  ++ err
+  Left StepsExceeded -> e
   Right e' -> e'
 
 -- | Given a symbol i and a scalar expression e, it decomposes
@@ -151,8 +163,8 @@ simplifyNRel inp_term@(NRelExp LTH0 inp_sofp) = do
         isTrivialNRel  _                            = False
 
         cheapSimplifyNRel :: BTerm -> AlgSimplifyM BTerm
-        cheapSimplifyNRel (NRelExp rel (NProd [Val v] _)) = do
-            succ' <- valLTHEQ0 rel v; return $ LogCt succ'
+        cheapSimplifyNRel (NRelExp rel (NProd [Val v] _)) =
+            LogCt <$> valLTHEQ0 rel v
         cheapSimplifyNRel e = return e
 simplifyNRel inp_term =
     return inp_term --- TODO: handle more cases.
@@ -167,14 +179,11 @@ gaussElimRel (RelExp LTH0 e) = do
     e_sofp <- toNumSofP =<< simplifyScal e
     e_scal<- simplifyScal =<< gaussAllLTH0 False S.empty e_sofp
     e_dnf <- toDNF e_scal
-    mapM (mapM (\f ->
-                  case f of
+    mapM (mapM (\case
                     LogCt c   -> return $ Val (BoolValue c)
                     PosId i   -> return $ Id  i $ scalExpType e
                     NegId i   -> return $ Id  i $ scalExpType e
-                    NRelExp rel ee -> do
-                      e_scal' <- fromNumSofP ee
-                      return $ RelExp rel e_scal'
+                    NRelExp rel ee -> RelExp rel <$> fromNumSofP ee
                )) e_dnf
 
 gaussElimRel _ =
@@ -219,6 +228,7 @@ primScalExpLTH0 _ = False
 type Prod = [ScalExp]
 gaussAllLTH0 :: Bool -> S.Set VName -> NNumExp -> AlgSimplifyM ScalExp
 gaussAllLTH0 static_only el_syms sofp = do
+    step
     let tp  = typeOfNAlg sofp
     rangesrep <- asks ranges
     e_scal <- fromNumSofP sofp
@@ -502,7 +512,9 @@ linearForm idd (NSum terms tp) = do
     -- check that b_terms do not contain idd
     b_succ <- foldM (\acc x ->
                         case x of
-                           NProd fs _ -> do let fs_scal = foldl STimes 1 fs
+                           NProd fs _ -> do let fs_scal = case fs of
+                                                            [] -> Val $ IntValue $ Int32Value 1
+                                                            f:fs' -> foldl STimes f fs'
                                             let b_ids = freeIn fs_scal
                                             return $ acc && not (idd `S.member` b_ids)
                            _          -> badAlgSimplifyM "linearForm: ILLEGAL222!!!!"
@@ -620,8 +632,7 @@ simplifyScal (SPlus e1o e2o) = do
 simplifyScal (SMinus e1 e2) = do
   let tp = scalExpType e1
   if e1 == e2
-    then do zero <- getZero tp
-            return $ Val zero
+    then Val <$> getZero tp
     else do min_1 <- getNeg1 $ scalExpType e1
             simplifyScal $ SPlus e1 $ STimes (Val min_1) e2
 
@@ -709,8 +720,7 @@ simplifyScal (SDiv e1o e2o) = do
               NProd fs tp -> do
                 e1Split <- mapM splitTerm (getTerms e1')
                 case e1Split of
-                  []  -> do zero <- getZero tp
-                            return $ Val zero
+                  []  -> Val <$> getZero tp
                   _   -> do (fs', e1Split')  <- trySimplifyDivRec fs [] e1Split
                             if length fs' == length fs
                             then turnBackAndDiv e1' e2' -- insuccess
@@ -752,8 +762,7 @@ simplifyScal (SPow e1 e2) = do
     e2' <- simplifyScal e2
 
     if isCt1 e1' || isCt0 e2'
-    then do one <- getPos1 tp
-            return $ Val one
+    then Val <$> getPos1 tp
     else if isCt1 e2'
     then return e1'
     else case (e1', e2') of
@@ -830,10 +839,10 @@ helperTimesDivMinMax isTimes isRev emo@MaxMin{} e = do
                             NProd _  _  -> return $ mkTimesDiv em e' -- simplifyScal =<< fromNumSofP (NProd (em:fs) tp)
                             NSum  ts tp -> do
                                 new_ts <-
-                                    mapM (\x -> case x of
-                                                  NProd fs _ -> return $ NProd (em:fs) tp
-                                                  _          -> badAlgSimplifyM
-                                                                "helperTimesDivMinMax: SofP invariant violated!"
+                                    mapM (\case
+                                             NProd fs _ -> return $ NProd (em:fs) tp
+                                             _          -> badAlgSimplifyM
+                                                           "helperTimesDivMinMax: SofP invariant violated!"
                                          ) ts
                                 simplifyScal =<< fromNumSofP ( NSum new_ts tp )
         _ -> simplifyScal $ mkTimesDiv em e
@@ -875,15 +884,14 @@ negateBTerm (NRelExp rel e) = do
             se <- fromNumSofP e
             ne <- toNumSofP =<< simplifyScal (SNeg $ SPlus se (Val (value (P.intValue it (1::Int)))))
             return $ NRelExp LTH0 ne
-        _ -> do
-            e' <- toNumSofP =<< negateSimplified =<< fromNumSofP e;
-            return $ NRelExp (if rel == LEQ0 then LTH0 else LEQ0) e'
+        _ -> NRelExp (if rel == LEQ0 then LTH0 else LEQ0) <$>
+             (toNumSofP =<< negateSimplified =<< fromNumSofP e)
 
 bterm2ScalExp :: BTerm -> AlgSimplifyM ScalExp
 bterm2ScalExp (LogCt v) = return $ Val $ BoolValue v
 bterm2ScalExp (PosId i) = return $ Id i int32
 bterm2ScalExp (NegId i) = return $ SNot $ Id i int32
-bterm2ScalExp (NRelExp rel e) = do e' <- fromNumSofP e; return $ RelExp rel e'
+bterm2ScalExp (NRelExp rel e) = RelExp rel <$> fromNumSofP e
 
 -- translates from DNF to ScalExp
 fromDNF :: DNF -> AlgSimplifyM ScalExp
@@ -1105,14 +1113,12 @@ negateSimplified (SQuot e1 e2) = do
     (e1', e2') <- helperNegateMult e1 e2; return $ SQuot e1' e2'
 negateSimplified (SRem e1 e2) =
     return $ SRem e1 e2
-negateSimplified (MaxMin ismin ts) = do
-    ts' <- mapM negateSimplified ts; return $ MaxMin (not ismin) ts'
-negateSimplified (RelExp LEQ0 e) = do
-    me <- negateSimplified e
-    return $ RelExp LTH0 me
-negateSimplified (RelExp LTH0 e) = do
-    me <- negateSimplified e
-    return $ RelExp LEQ0 me
+negateSimplified (MaxMin ismin ts) =
+    MaxMin (not ismin) <$> mapM negateSimplified ts
+negateSimplified (RelExp LEQ0 e) =
+    RelExp LTH0 <$> negateSimplified e
+negateSimplified (RelExp LTH0 e) =
+    RelExp LEQ0 <$> negateSimplified e
 negateSimplified SLogAnd{} = badAlgSimplifyM "negateSimplified: SLogAnd unimplemented!"
 negateSimplified SLogOr{} = badAlgSimplifyM "negateSimplified: SLogOr  unimplemented!"
 
@@ -1153,9 +1159,8 @@ toNumSofP s_e = return $ NProd [s_e] $ scalExpType s_e
 
 
 fromNumSofP :: NNumExp -> AlgSimplifyM ScalExp
-fromNumSofP (NSum [ ] t) = do
-    zero <- getZero t
-    return $ Val zero
+fromNumSofP (NSum [ ] t) =
+    Val <$> getZero t
 fromNumSofP (NSum [f] _) = fromNumSofP f
 fromNumSofP (NSum (f:fs) t) = do
     fs_e <- fromNumSofP $ NSum fs t
@@ -1267,7 +1272,7 @@ mulVals (IntValue v1) (IntValue v2) =
   return $ IntValue $ P.doMul v1 v2
 mulVals v1 v2 =
   badAlgSimplifyM $ "mulVals: operands not of (the same) numeral type! "++
-  pretty (PrimVal v1)++" "++pretty (PrimVal v2)
+  pretty v1++" "++pretty v2
 
 divVals :: PrimValue -> PrimValue -> AlgSimplifyM PrimValue
 divVals (IntValue v1) (IntValue v2) =

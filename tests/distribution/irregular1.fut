@@ -2,7 +2,6 @@
 -- really subtle irregularity.
 --
 -- ==
--- tags { no_opencl }
 -- input {
 --   [ [ [ [1,2,3], [4,5,6] ]
 --     ]
@@ -28,17 +27,17 @@
 -- structure distributed { }
 
 let addRows (xs: []i32, ys: []i32): []i32 =
-  map (+) xs ys
+  map2 (+) xs ys
 
-let main (xssss: [][][][]i32, cs: []i32): [][][][]i32 =
-  map (\(xsss: [][][]i32) (c: i32): [][][]i32  ->
-            let yss = unsafe reshape (2,c) xsss in
+let main (xssss: [][][][]i32) (cs: []i32): [][][][]i32 =
+  map2 (\(xsss: [][][]i32) (c: i32): [][][]i32  -> unsafe
+            let yss = unflatten 2 c (flatten_3d xsss) in
             map  (\(xss: [][]i32): [][]i32  ->
-                   map (\(xs: []i32) (ys: []i32): []i32  ->
+                   map2 (\(xs: []i32) (ys: []i32): []i32  ->
                              -- An implicit reshape will go here that
                              -- cannot be distributed - this messed up
                              -- the compiler.
-                             addRows(xs,ys)
+                             unsafe addRows(xs,ys)
                           ) xss yss
                 ) xsss
          ) xssss cs

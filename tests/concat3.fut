@@ -1,13 +1,7 @@
+-- Fusion of concats.
 -- ==
--- input {
---   [[1,2,3],[4,5,6]]    -- a
---   [[7,8,9],[10,11,12]] -- b
--- }
--- output {
---   [
---       [1,2,3],[4,5,6],[7,8,9],[10,11,12],
---       [1,2,3],[4,5,6],[7,8,9],[10,11,12]
---   ]
--- }
-let main(a: [][]i32, b: [][]i32): [][]i32 =
-    concat a b a b
+-- input { [1] [2] [3] } output { [1,2,3] }
+-- structure { Concat 1 }
+
+let main (xs: []i32) (ys: []i32) (zs: []i32) =
+  concat xs (concat ys zs)

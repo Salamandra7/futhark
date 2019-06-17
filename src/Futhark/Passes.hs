@@ -4,17 +4,13 @@
 module Futhark.Passes
   ( standardPipeline
   , sequentialPipeline
+  , kernelsPipeline
+  , sequentialCpuPipeline
   , gpuPipeline
-
-  , CompilationMode (..)
   )
 where
 
-import Control.Category ((>>>), id)
-import Control.Monad.Except
-import Data.Maybe
-
-import Prelude hiding (id)
+import Control.Category ((>>>))
 
 import Futhark.Optimise.CSE
 import Futhark.Optimise.Fusion
@@ -28,28 +24,19 @@ import Futhark.Pass.ExplicitAllocations
 import Futhark.Pass.ExtractKernels
 import Futhark.Pass.FirstOrderTransform
 import Futhark.Pass.KernelBabysitting
+import Futhark.Pass.ResolveAssertions
 import Futhark.Pass.Simplify
-import Futhark.Pass
 import Futhark.Pipeline
 import Futhark.Representation.ExplicitMemory (ExplicitMemory)
+import Futhark.Representation.Kernels (Kernels)
 import Futhark.Representation.SOACS (SOACS)
-import Futhark.Representation.AST.Syntax
+import Futhark.Util
 
--- | Are we compiling the Futhark program as an executable or a
--- library?  This affects which functions are considered as roots for
--- dead code elimination and ultimately exist in generated code.
-data CompilationMode = Executable
-                     -- ^ Only the top-level function named @main@ is
-                       -- alive.
-                     | Library
-                       -- ^ Only top-level functions marked @entry@
-                       -- are alive.
-
-standardPipeline :: CompilationMode -> Pipeline SOACS SOACS
-standardPipeline mode =
-  checkForEntryPoints mode >>>
+standardPipeline :: Pipeline SOACS SOACS
+standardPipeline =
   passes [ simplifySOACS
          , inlineAndRemoveDeadFunctions
+         , simplifySOACS
          , performCSE True
          , simplifySOACS
            -- We run fusion twice
@@ -59,41 +46,25 @@ standardPipeline mode =
          , fuseSOACs
          , performCSE True
          , simplifySOACS
+         , resolveAssertions
          , removeDeadFunctions
          ]
-  where checkForEntryPoints :: CompilationMode -> Pipeline SOACS SOACS
-        checkForEntryPoints Library = id
-        checkForEntryPoints Executable =
-          onePass Pass { passName = "Check for main function"
-                       , passDescription = "Check if an entry point exists"
-                       , passFunction = \prog -> do checkForMain $ progFunctions prog
-                                                    return prog
-                       }
 
-        checkForMain ps
-          | not $ any (isJust . funDefEntryPoint) ps =
-              throwError "No entry points defined."
-          | otherwise =
-              return ()
+-- Do we use in-place lowering?  Currently enabled by default.  Disable by
+-- setting the environment variable IN_PLACE_LOWERING=0.
+usesInPlaceLowering :: Bool
+usesInPlaceLowering =
+  isEnvVarSet "IN_PLACE_LOWERING" True
 
-sequentialPipeline :: CompilationMode -> Pipeline SOACS ExplicitMemory
-sequentialPipeline mode =
-  standardPipeline mode >>>
-  onePass firstOrderTransform >>>
-  passes [ simplifyKernels
-         , inPlaceLowering
-         ] >>>
-  onePass explicitAllocations >>>
-  passes [ simplifyExplicitMemory
-         , performCSE False
-         , simplifyExplicitMemory
-         , doubleBuffer
-         , simplifyExplicitMemory
-         ]
+inPlaceLoweringMaybe :: Pipeline Kernels Kernels
+inPlaceLoweringMaybe =
+  if usesInPlaceLowering
+  then onePass inPlaceLowering
+  else passes []
 
-gpuPipeline :: CompilationMode -> Pipeline SOACS ExplicitMemory
-gpuPipeline mode =
-  standardPipeline mode >>>
+kernelsPipeline :: Pipeline SOACS Kernels
+kernelsPipeline =
+  standardPipeline >>>
   onePass extractKernels >>>
   passes [ simplifyKernels
          , babysitKernels
@@ -103,8 +74,31 @@ gpuPipeline mode =
          , simplifyKernels
          , performCSE True
          , simplifyKernels
-         , inPlaceLowering
          ] >>>
+  inPlaceLoweringMaybe
+
+sequentialPipeline :: Pipeline SOACS Kernels
+sequentialPipeline =
+  standardPipeline >>>
+  onePass firstOrderTransform >>>
+  passes [ simplifyKernels
+         ] >>>
+  inPlaceLoweringMaybe
+
+sequentialCpuPipeline :: Pipeline SOACS ExplicitMemory
+sequentialCpuPipeline =
+  sequentialPipeline >>>
+  onePass explicitAllocations >>>
+  passes [ simplifyExplicitMemory
+         , performCSE False
+         , simplifyExplicitMemory
+         , doubleBuffer
+         , simplifyExplicitMemory
+         ]
+
+gpuPipeline :: Pipeline SOACS ExplicitMemory
+gpuPipeline =
+  kernelsPipeline >>>
   onePass explicitAllocations >>>
   passes [ simplifyExplicitMemory
          , performCSE False

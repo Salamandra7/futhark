@@ -1,7 +1,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE TupleSections #-}
-{-# LANGUAGE  GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 -- | Imperative intermediate language used as a stepping stone in code generation.
 --
 -- This is a generic representation parametrised on an extensible
@@ -31,7 +31,11 @@ module Futhark.CodeGen.ImpCode
   , Volatility (..)
   , Arg (..)
   , var
+  , vi32
   , index
+  , ErrorMsg(..)
+  , ErrorMsgPart(..)
+  , ArrayContents(..)
 
     -- * Typed enumerations
   , Count (..)
@@ -47,7 +51,6 @@ module Futhark.CodeGen.ImpCode
   , memSizeToExp
 
     -- * Analysis
-  , functionsCalled
 
     -- * Re-exports from other modules.
   , module Language.Futhark.Core
@@ -56,24 +59,20 @@ module Futhark.CodeGen.ImpCode
   )
   where
 
-import Control.Applicative
-import Data.Monoid
-import Data.List hiding (foldr)
+import Data.Monoid ((<>))
+import Data.List
 import Data.Loc
 import Data.Traversable
-import Data.Foldable
 import qualified Data.Set as S
-
-import Prelude hiding (foldr)
 
 import Language.Futhark.Core
 import Futhark.Representation.Primitive
-import Futhark.Representation.AST.Syntax (Space(..), SpaceId)
+import Futhark.Representation.AST.Syntax
+  (Space(..), SpaceId, ErrorMsg(..), ErrorMsgPart(..))
 import Futhark.Representation.AST.Attributes.Names
 import Futhark.Representation.AST.Pretty ()
 import Futhark.Util.IntegralExp
 import Futhark.Analysis.PrimExp
-
 import Futhark.Util.Pretty hiding (space)
 
 data Size = ConstSize Int64
@@ -96,22 +95,24 @@ paramName (ScalarParam name _) = name
 -- | A collection of imperative functions.
 newtype Functions a = Functions [(Name, Function a)]
 
+instance Semigroup (Functions a) where
+  Functions x <> Functions y = Functions $ x ++ y
+
 instance Monoid (Functions a) where
   mempty = Functions []
-  Functions x `mappend` Functions y = Functions $ x ++ y
 
 data Signedness = TypeUnsigned
                 | TypeDirect
-                deriving (Show)
+                deriving (Eq, Show)
 
 -- | A description of an externally meaningful value.
-data ValueDesc = ArrayValue VName MemSize Space PrimType Signedness [DimSize]
+data ValueDesc = ArrayValue VName Space PrimType Signedness [DimSize]
                -- ^ An array with memory block, memory block size,
                -- memory space, element type, signedness of element
                -- type (if applicable), and shape.
                | ScalarValue PrimType Signedness VName
                -- ^ A scalar value with signedness if applicable.
-               deriving (Show)
+               deriving (Eq, Show)
 
 -- | ^ An externally visible value.  This can be an opaque value
 -- (covering several physical internal values), or a single value that
@@ -138,36 +139,60 @@ data FunctionT a = Function { functionEntry :: Bool
 -- | Type alias for namespace control.
 type Function = FunctionT
 
+-- | The contents of a statically declared constant array.  Such
+-- arrays are always unidimensional, and reshaped if necessary in the
+-- code that uses them.
+data ArrayContents = ArrayValues [PrimValue]
+                     -- ^ Precisely these values.
+                   | ArrayZeros Int
+                     -- ^ This many zeroes.
+                     deriving (Show)
+
 data Code a = Skip
             | Code a :>>: Code a
             | For VName IntType Exp (Code a)
             | While Exp (Code a)
             | DeclareMem VName Space
             | DeclareScalar VName PrimType
+            | DeclareArray VName Space PrimType ArrayContents
+              -- ^ Create an array containing the given values.  The
+              -- lifetime of the array will be the entire application.
+              -- This is mostly used for constant arrays, but also for
+              -- some bookkeeping data, like the synchronisation
+              -- counts used to implement reduction.
             | Allocate VName (Count Bytes) Space
               -- ^ Memory space must match the corresponding
               -- 'DeclareMem'.
+            | Free VName Space
+              -- ^ Indicate that some memory block will never again be
+              -- referenced via the indicated variable.  However, it
+              -- may still be accessed through aliases.  It is only
+              -- safe to actually deallocate the memory block if this
+              -- is the last reference.  There is no guarantee that
+              -- all memory blocks will be freed with this statement.
+              -- Backends are free to ignore it entirely.
             | Copy VName (Count Bytes) Space VName (Count Bytes) Space (Count Bytes)
               -- ^ Destination, offset in destination, destination
               -- space, source, offset in source, offset space, number
               -- of bytes.
-            | Scatter VName (Count Bytes) PrimType Space Volatility Exp
+            | Write VName (Count Elements) PrimType Space Volatility Exp
             | SetScalar VName Exp
             | SetMem VName VName Space
               -- ^ Must be in same space.
             | Call [VName] Name [Arg]
             | If Exp (Code a) (Code a)
-            | Assert Exp SrcLoc
+            | Assert Exp (ErrorMsg Exp) (SrcLoc, [SrcLoc])
             | Comment String (Code a)
               -- ^ Has the same semantics as the contained code, but
               -- the comment should show up in generated code for ease
               -- of inspection.
-            | DebugPrint String PrimType Exp
+            | DebugPrint String (Maybe (PrimType, Exp))
               -- ^ Print the given value (of the given type) to the
               -- screen, somehow annotated with the given string as a
-              -- description.  This has no semantic meaning, but is
-              -- used entirely for debugging.  Code generators are
-              -- free to ignore this statement.
+              -- description.  If no type/value pair, just print the
+              -- string.  This has no semantic meaning, but is used
+              -- entirely for debugging.  Code generators are free to
+              -- ignore this statement.
             | Op a
             deriving (Show)
 
@@ -175,15 +200,17 @@ data Code a = Skip
 data Volatility = Volatile | Nonvolatile
                 deriving (Eq, Ord, Show)
 
+instance Semigroup (Code a) where
+  Skip <> y    = y
+  x    <> Skip = x
+  x    <> y    = x :>>: y
+
 instance Monoid (Code a) where
   mempty = Skip
-  Skip `mappend` y    = y
-  x    `mappend` Skip = x
-  x    `mappend` y    = x :>>: y
 
 data ExpLeaf = ScalarVar VName
              | SizeOf PrimType
-             | Index VName (Count Bytes) PrimType Space Volatility
+             | Index VName (Count Elements) PrimType Space Volatility
            deriving (Eq, Show)
 
 type Exp = PrimExp ExpLeaf
@@ -228,7 +255,11 @@ sizeToExp (ConstSize x) = ValueExp $ IntValue $ Int32Value $ fromIntegral x
 var :: VName -> PrimType -> Exp
 var = LeafExp . ScalarVar
 
-index :: VName -> Count Bytes -> PrimType -> Space -> Volatility -> Exp
+-- | Turn a 'VName' into a 'int32' 'Imp.ScalarVar'.
+vi32 :: VName -> Exp
+vi32 = flip var $ IntType Int32
+
+index :: VName -> Count Elements -> PrimType -> Space -> Volatility -> Exp
 index arr i t s vol = LeafExp (Index arr i t s vol) t
 
 -- Prettyprinting definitions.
@@ -261,8 +292,8 @@ instance Pretty ValueDesc where
     ppr t <+> ppr name <> ept'
     where ept' = case ept of TypeUnsigned -> text " (unsigned)"
                              TypeDirect   -> mempty
-  ppr (ArrayValue mem memsize space et ept shape) =
-    foldr f (ppr et) shape <+> text "at" <+> ppr mem <> parens (ppr memsize) <> space' <+> ept'
+  ppr (ArrayValue mem space et ept shape) =
+    foldr f (ppr et) shape <+> text "at" <+> ppr mem <> space' <+> ept'
     where f e s = brackets $ s <> comma <> ppr e
           ept' = case ept of TypeUnsigned -> text " (unsigned)"
                              TypeDirect   -> mempty
@@ -280,6 +311,10 @@ instance Pretty Size where
   ppr (ConstSize x) = ppr x
   ppr (VarSize v)   = ppr v
 
+instance Pretty ArrayContents where
+  ppr (ArrayValues vs) = braces (commasep $ map ppr vs)
+  ppr (ArrayZeros n) = braces (text "0") <+> text "*" <+> ppr n
+
 instance Pretty op => Pretty (Code op) where
   ppr (Op op) = ppr op
   ppr Skip   = text "skip"
@@ -296,9 +331,14 @@ instance Pretty op => Pretty (Code op) where
     text "var" <+> ppr name <> text ": mem" <> parens (ppr space)
   ppr (DeclareScalar name t) =
     text "var" <+> ppr name <> text ":" <+> ppr t
+  ppr (DeclareArray name space t vs) =
+    text "array" <+> ppr name <> text "@" <> ppr space <+> text ":" <+> ppr t <+>
+    equals <+> ppr vs
   ppr (Allocate name e space) =
     ppr name <+> text "<-" <+> text "malloc" <> parens (ppr e) <> ppr space
-  ppr (Scatter name i bt space vol val) =
+  ppr (Free name space) =
+    text "free" <> parens (ppr name) <> ppr space
+  ppr (Write name i bt space vol val) =
     ppr name <> langle <> vol' <> ppr bt <> ppr space <> rangle <> brackets (ppr i) <+>
     text "<-" <+> ppr val
     where vol' = case vol of Volatile -> text "volatile "
@@ -307,8 +347,8 @@ instance Pretty op => Pretty (Code op) where
     ppr name <+> text "<-" <+> ppr val
   ppr (SetMem dest from space) =
     ppr dest <+> text "<-" <+> ppr from <+> text "@" <> ppr space
-  ppr (Assert e _) =
-    text "assert" <> parens (ppr e)
+  ppr (Assert e msg _) =
+    text "assert" <> parens (commasep [ppr msg, ppr e])
   ppr (Copy dest destoffset destspace src srcoffset srcspace size) =
     text "memcpy" <>
     parens (ppMemLoc dest destoffset <> ppr destspace <> comma </>
@@ -327,8 +367,10 @@ instance Pretty op => Pretty (Code op) where
     ppr fname <> parens (commasep $ map ppr args)
   ppr (Comment s code) =
     text "--" <+> text s </> ppr code
-  ppr (DebugPrint desc pt e) =
+  ppr (DebugPrint desc (Just (pt, e))) =
     text "debug" <+> parens (commasep [text (show desc), ppr pt, ppr e])
+  ppr (DebugPrint desc Nothing) =
+    text "debug" <+> parens (text (show desc))
 
 instance Pretty Arg where
   ppr (MemArg m) = ppr m
@@ -391,28 +433,33 @@ instance Traversable Code where
     pure $ DeclareMem name space
   traverse _ (DeclareScalar name bt) =
     pure $ DeclareScalar name bt
+  traverse _ (DeclareArray name space t vs) =
+    pure $ DeclareArray name space t vs
   traverse _ (Allocate name size s) =
     pure $ Allocate name size s
+  traverse _ (Free name space) =
+    pure $ Free name space
   traverse _ (Copy dest destoffset destspace src srcoffset srcspace size) =
     pure $ Copy dest destoffset destspace src srcoffset srcspace size
-  traverse _ (Scatter name i bt val space vol) =
-    pure $ Scatter name i bt val space vol
+  traverse _ (Write name i bt val space vol) =
+    pure $ Write name i bt val space vol
   traverse _ (SetScalar name val) =
     pure $ SetScalar name val
   traverse _ (SetMem dest from space) =
     pure $ SetMem dest from space
-  traverse _ (Assert e loc) =
-    pure $ Assert e loc
+  traverse _ (Assert e msg loc) =
+    pure $ Assert e msg loc
   traverse _ (Call dests fname args) =
     pure $ Call dests fname args
   traverse f (Comment s code) =
     Comment s <$> traverse f code
-  traverse _ (DebugPrint s t e) =
-    pure $ DebugPrint s t e
+  traverse _ (DebugPrint s v) =
+    pure $ DebugPrint s v
 
 declaredIn :: Code a -> Names
 declaredIn (DeclareMem name _) = S.singleton name
 declaredIn (DeclareScalar name _) = S.singleton name
+declaredIn (DeclareArray name _ _ _) = S.singleton name
 declaredIn (If _ t f) = declaredIn t <> declaredIn f
 declaredIn (x :>>: y) = declaredIn x <> declaredIn y
 declaredIn (For i _ _ body) = S.singleton i <> declaredIn body
@@ -433,13 +480,17 @@ instance FreeIn a => FreeIn (Code a) where
     mempty
   freeIn DeclareScalar{} =
     mempty
+  freeIn DeclareArray{} =
+    mempty
   freeIn (Allocate name size _) =
     freeIn name <> freeIn size
+  freeIn (Free name _) =
+    freeIn name
   freeIn (Copy dest x _ src y _ n) =
     freeIn dest <> freeIn x <> freeIn src <> freeIn y <> freeIn n
   freeIn (SetMem x y _) =
     freeIn x <> freeIn y
-  freeIn (Scatter v i _ _ _ e) =
+  freeIn (Write v i _ _ _ e) =
     freeIn v <> freeIn i <> freeIn e
   freeIn (SetScalar x y) =
     freeIn x <> freeIn y
@@ -447,14 +498,14 @@ instance FreeIn a => FreeIn (Code a) where
     freeIn dests <> freeIn args
   freeIn (If cond t f) =
     freeIn cond <> freeIn t <> freeIn f
-  freeIn (Assert e _) =
+  freeIn (Assert e _ _) =
     freeIn e
   freeIn (Op op) =
     freeIn op
   freeIn (Comment _ code) =
     freeIn code
-  freeIn (DebugPrint _ _ e) =
-    freeIn e
+  freeIn (DebugPrint _ v) =
+    maybe mempty (freeIn . snd) v
 
 instance FreeIn ExpLeaf where
   freeIn (Index v e _ _ _) = freeIn v <> freeIn e
@@ -468,11 +519,3 @@ instance FreeIn Arg where
 instance FreeIn Size where
   freeIn (VarSize name) = S.singleton name
   freeIn (ConstSize _) = mempty
-
-functionsCalled :: Code a -> S.Set Name
-functionsCalled (If _ t f) = functionsCalled t <> functionsCalled f
-functionsCalled (x :>>: y) = functionsCalled x <> functionsCalled y
-functionsCalled (For _ _ _ body) = functionsCalled body
-functionsCalled (While _ body) = functionsCalled body
-functionsCalled (Call _ fname _) = S.singleton fname
-functionsCalled _ = mempty

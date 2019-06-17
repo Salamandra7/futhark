@@ -15,9 +15,10 @@
 --    [0.0, 0.0, 0.0]]
 -- }
 
-let brownianBridgeDates (bb_inds: [3][#num_dates]i32)
-                        (bb_data: [3][#num_dates]f64)
-                        (gauss: [#num_dates]f64): []f64 =
+let brownianBridgeDates [num_dates]
+                        (bb_inds: [3][num_dates]i32)
+                        (bb_data: [3][num_dates]f64)
+                        (gauss: [num_dates]f64): []f64 =
     let bi = bb_inds[0]
     let li = bb_inds[1]
     let ri = bb_inds[2]
@@ -28,8 +29,7 @@ let brownianBridgeDates (bb_inds: [3][#num_dates]i32)
     let bbrow = replicate num_dates 0.0
     let bbrow[ bi[0]-1 ] = sd[0] * gauss[0] in
 
-    loop (bbrow) =
-        for i < num_dates-1 do  -- use i+1 since i in 1 .. num_dates-1
+    let bbrow = loop (bbrow) for i < num_dates-1 do  -- use i+1 since i in 1 .. num_dates-1
             unsafe
             let j  = li[i+1] - 1
             let k  = ri[i+1] - 1
@@ -46,33 +46,32 @@ let brownianBridgeDates (bb_inds: [3][#num_dates]i32)
 
         -- This can be written as map-reduce, but it
         --   needs delayed arrays to be mapped nicely!
-    in loop (bbrow) =
+    in loop (bbrow)
         for ii < num_dates-1 do
             let i = num_dates - (ii+1)
             let bbrow[i] = bbrow[i] - bbrow[i-1]
             in  bbrow
-       in bbrow
 
-let brownianBridge (num_und:
+let brownianBridge [num_dates]
+               (num_und:
                 i32,
-                bb_inds: [3][#num_dates]i32,
-                bb_data: [3][#num_dates]f64,
+                bb_inds: [3][num_dates]i32,
+                bb_data: [3][num_dates]f64,
                  gaussian_arr: []f64
             ): [][]f64 =
-    let gauss2d  = reshape (num_dates,num_und) gaussian_arr
-    let gauss2dT = transpose(gauss2d) in
-      transpose(
+    let gauss2d  = unflatten num_dates num_und gaussian_arr
+    let gauss2dT = transpose gauss2d in
+      transpose (
         map (brownianBridgeDates bb_inds bb_data) gauss2dT
       )
 
-let main(num_und:
-              i32,
-             bb_inds: [3][#num_dates]i32,
-             arr_usz: []f64
-): [][]f64 =
-  let arr    = reshape (num_dates*num_und) arr_usz
+let main [num_dates] (num_und: i32)
+                     (bb_inds: [3][num_dates]i32)
+                     (arr_usz: []f64): [][]f64 =
+  let n = num_dates*num_und
+  let arr    = arr_usz : [n]f64
   let bb_data= map (\(row: []i32): []f64  ->
-                        map f64 row
+                        map r64 row
                   ) (bb_inds )
   let bb_mat = brownianBridge( num_und, bb_inds, bb_data, arr )
   in  bb_mat

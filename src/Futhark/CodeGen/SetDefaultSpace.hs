@@ -33,16 +33,20 @@ setExtValueSpace space (TransparentValue v) =
   TransparentValue $ setValueSpace space v
 
 setValueSpace :: Space -> ValueDesc -> ValueDesc
-setValueSpace space (ArrayValue mem memsize _ bt ept shape) =
-  ArrayValue mem memsize space bt ept shape
+setValueSpace space (ArrayValue mem _ bt ept shape) =
+  ArrayValue mem space bt ept shape
 setValueSpace _ (ScalarValue bt ept v) =
   ScalarValue bt ept v
 
 setBodySpace :: Space -> Code op -> Code op
 setBodySpace space (Allocate v e old_space) =
   Allocate v (setCountSpace space e) $ setSpace space old_space
+setBodySpace space (Free v old_space) =
+  Free v $ setSpace space old_space
 setBodySpace space (DeclareMem name old_space) =
   DeclareMem name $ setSpace space old_space
+setBodySpace space (DeclareArray name _ t vs) =
+  DeclareArray name space t vs
 setBodySpace space (Copy dest dest_offset dest_space src src_offset src_space n) =
   Copy
   dest (setCountSpace space dest_offset) dest_space'
@@ -50,8 +54,8 @@ setBodySpace space (Copy dest dest_offset dest_space src src_offset src_space n)
   setCountSpace space n
   where dest_space' = setSpace space dest_space
         src_space' = setSpace space src_space
-setBodySpace space (Scatter dest dest_offset bt dest_space vol e) =
-  Scatter dest (setCountSpace space dest_offset) bt (setSpace space dest_space)
+setBodySpace space (Write dest dest_offset bt dest_space vol e) =
+  Write dest (setCountSpace space dest_offset) bt (setSpace space dest_space)
   vol (setExpSpace space e)
 setBodySpace space (c1 :>>: c2) =
   setBodySpace space c1 :>>: setBodySpace space c2
@@ -75,10 +79,10 @@ setBodySpace space (Call dests fname args) =
   Call dests fname $ map setArgSpace args
   where setArgSpace (MemArg m) = MemArg m
         setArgSpace (ExpArg e) = ExpArg $ setExpSpace space e
-setBodySpace space (Assert e loc) =
-  Assert (setExpSpace space e) loc
-setBodySpace space (DebugPrint s t e) =
-  DebugPrint s t (setExpSpace space e)
+setBodySpace space (Assert e msg loc) =
+  Assert (setExpSpace space e) msg loc
+setBodySpace space (DebugPrint s v) =
+  DebugPrint s $ fmap (fmap (setExpSpace space)) v
 setBodySpace _ (Op op) =
   Op op
 

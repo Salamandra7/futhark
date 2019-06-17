@@ -3,7 +3,6 @@ module Futhark.CodeGen.Backends.SequentialPython
      ) where
 
 import Control.Monad
-import Data.Traversable
 
 import Futhark.Error
 import Futhark.Representation.ExplicitMemory
@@ -13,8 +12,6 @@ import qualified Futhark.CodeGen.Backends.GenericPython as GenericPython
 import Futhark.CodeGen.Backends.GenericPython.Definitions
 import Futhark.CodeGen.Backends.GenericPython.AST
 import Futhark.MonadFreshNames
-
-import Prelude
 
 compileProg :: MonadFreshNames m =>
                Maybe String -> Prog ExplicitMemory -> m (Either InternalError String)
@@ -30,8 +27,15 @@ compileProg module_name =
                    Import "numpy" $ Just "np",
                    Import "ctypes" $ Just "ct",
                    Import "time" Nothing]
-        defines = [Escape pyReader, Escape pyFunctions, Escape pyPanic]
+        defines = [Escape pyValues, Escape pyFunctions, Escape pyPanic, Escape pyTuning]
         operations :: GenericPython.Operations Imp.Sequential ()
-        operations = GenericPython.defaultOperations {
-          GenericPython.opsCompiler = const $ return ()
-        }
+        operations = GenericPython.defaultOperations
+                     { GenericPython.opsCompiler = const $ return ()
+                     , GenericPython.opsCopy = copySequentialMemory
+                     }
+
+copySequentialMemory :: GenericPython.Copy Imp.Sequential ()
+copySequentialMemory destmem destidx DefaultSpace srcmem srcidx DefaultSpace nbytes _bt =
+  GenericPython.copyMemoryDefaultSpace destmem destidx srcmem srcidx nbytes
+copySequentialMemory _ _ destspace _ _ srcspace _ _ =
+  error $ "Cannot copy to " ++ show destspace ++ " from " ++ show srcspace

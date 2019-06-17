@@ -9,8 +9,7 @@ module Futhark.Optimise.Fusion.TryFusion
 import Control.Applicative
 import Control.Monad.State
 import Control.Monad.Reader
-
-import Prelude
+import qualified Control.Monad.Fail as Fail
 
 import Futhark.Representation.SOACS
 import Futhark.MonadFreshNames
@@ -18,7 +17,7 @@ import Futhark.MonadFreshNames
 newtype TryFusion a = TryFusion (ReaderT (Scope SOACS)
                                  (StateT VNameSource Maybe)
                                  a)
-  deriving (Functor, Applicative, Alternative, Monad,
+  deriving (Functor, Applicative, Alternative, Monad, Fail.MonadFail,
             MonadFreshNames,
             HasScope SOACS,
             LocalScope SOACS)

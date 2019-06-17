@@ -1,6 +1,8 @@
-# Scalar functions.
+# Start of scalar.py.
 
 import numpy as np
+import math
+import struct
 
 def signed(x):
   if type(x) == np.uint8:
@@ -29,22 +31,22 @@ def ashrN(x,y):
   return x >> y
 
 def sdivN(x,y):
-  return x / y
+  return x // y
 
 def smodN(x,y):
   return x % y
 
 def udivN(x,y):
-  return signed(unsigned(x) / unsigned(y))
+  return signed(unsigned(x) // unsigned(y))
 
 def umodN(x,y):
   return signed(unsigned(x) % unsigned(y))
 
 def squotN(x,y):
-  return np.int32(float(x) / float(y))
+  return np.floor_divide(np.abs(x), np.abs(y)) * np.sign(x) * np.sign(y)
 
 def sremN(x,y):
-  return np.fmod(x,y)
+  return np.remainder(np.abs(x), np.abs(y)) * np.sign(x)
 
 def sminN(x,y):
   return min(x,y)
@@ -104,7 +106,22 @@ def sext_T_i32(x):
   return np.int32(x)
 
 def sext_T_i64(x):
-  return np.int32(x)
+  return np.int64(x)
+
+def itob_T_bool(x):
+  return np.bool(x)
+
+def btoi_bool_i8(x):
+  return np.int8(x)
+
+def btoi_bool_i16(x):
+  return np.int8(x)
+
+def btoi_bool_i32(x):
+  return np.int8(x)
+
+def btoi_bool_i64(x):
+  return np.int8(x)
 
 def zext_i8_i8(x):
   return np.int8(np.uint8(x))
@@ -178,6 +195,7 @@ sext_i8_i8 = sext_i16_i8 = sext_i32_i8 = sext_i64_i8 = sext_T_i8
 sext_i8_i16 = sext_i16_i16 = sext_i32_i16 = sext_i64_i16 = sext_T_i16
 sext_i8_i32 = sext_i16_i32 = sext_i32_i32 = sext_i64_i32 = sext_T_i32
 sext_i8_i64 = sext_i16_i64 = sext_i32_i64 = sext_i64_i64 = sext_T_i64
+itob_i8_bool = itob_i16_bool = itob_i32_bool = itob_i64_bool = itob_T_bool
 
 def ssignum(x):
   return np.sign(x)
@@ -245,6 +263,12 @@ def fpconv_f64_f32(x):
 def futhark_log64(x):
   return np.float64(np.log(x))
 
+def futhark_log2_64(x):
+  return np.float64(np.log2(x))
+
+def futhark_log10_64(x):
+  return np.float64(np.log10(x))
+
 def futhark_sqrt64(x):
   return np.sqrt(x)
 
@@ -256,6 +280,9 @@ def futhark_cos64(x):
 
 def futhark_sin64(x):
   return np.sin(x)
+
+def futhark_tan64(x):
+  return np.tan(x)
 
 def futhark_acos64(x):
   return np.arccos(x)
@@ -269,14 +296,37 @@ def futhark_atan64(x):
 def futhark_atan2_64(x, y):
   return np.arctan2(x, y)
 
+def futhark_gamma64(x):
+  return np.float64(math.gamma(x))
+
+def futhark_lgamma64(x):
+  return np.float64(math.lgamma(x))
+
+def futhark_round64(x):
+  return np.round(x)
+
 def futhark_isnan64(x):
   return np.isnan(x)
 
 def futhark_isinf64(x):
   return np.isinf(x)
 
+def futhark_to_bits64(x):
+  s = struct.pack('>d', x)
+  return np.int64(struct.unpack('>q', s)[0])
+
+def futhark_from_bits64(x):
+  s = struct.pack('>q', x)
+  return np.float64(struct.unpack('>d', s)[0])
+
 def futhark_log32(x):
   return np.float32(np.log(x))
+
+def futhark_log2_32(x):
+  return np.float32(np.log2(x))
+
+def futhark_log10_32(x):
+  return np.float32(np.log10(x))
 
 def futhark_sqrt32(x):
   return np.float32(np.sqrt(x))
@@ -290,6 +340,9 @@ def futhark_cos32(x):
 def futhark_sin32(x):
   return np.sin(x)
 
+def futhark_tan32(x):
+  return np.tan(x)
+
 def futhark_acos32(x):
   return np.arccos(x)
 
@@ -302,8 +355,27 @@ def futhark_atan32(x):
 def futhark_atan2_32(x, y):
   return np.arctan2(x, y)
 
+def futhark_gamma32(x):
+  return np.float32(math.gamma(x))
+
+def futhark_lgamma32(x):
+  return np.float32(math.lgamma(x))
+
+def futhark_round32(x):
+  return np.round(x)
+
 def futhark_isnan32(x):
   return np.isnan(x)
 
 def futhark_isinf32(x):
   return np.isinf(x)
+
+def futhark_to_bits32(x):
+  s = struct.pack('>f', x)
+  return np.int32(struct.unpack('>l', s)[0])
+
+def futhark_from_bits32(x):
+  s = struct.pack('>l', x)
+  return np.float32(struct.unpack('>f', s)[0])
+
+# End of scalar.py.

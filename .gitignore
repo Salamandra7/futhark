@@ -6,31 +6,13 @@
 
 \#*\#
 .#*
+*~
 
 # Ignore cabal build directory.
 dist
 
 # Ignore Stack junk
 .stack-work
-
-# Ignore result of test suite.
-tests/*actual-*
-tests/**/*actual-*
-tests/*expected-*
-tests/**/*expected-*
-tests/*bin
-tests/**/*bin
-tests/*c
-tests/**/*c
-examples/*actual-*
-examples/**/*actual-*
-examples/*expected-*
-examples/**/*expected-*
-examples/*bin
-examples/**/*bin
-examples/*c
-examples/**/*c
-*~
 
 # Ignore side-effects of compilation.
 *.aux
@@ -45,8 +27,6 @@ examples/**/*c
 *.toc
 *.vrb
 *.nav
-
-!tests/**/*.out
 
 # Ignore core dumps.
 core

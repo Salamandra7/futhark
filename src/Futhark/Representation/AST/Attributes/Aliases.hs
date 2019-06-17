@@ -11,9 +11,7 @@ module Futhark.Representation.AST.Attributes.Aliases
          -- * Consumption
        , consumedInStm
        , consumedInExp
-       , consumedInPattern
        , consumedByLambda
-       , consumedByExtLambda
        -- * Extensibility
        , AliasedOp (..)
        , CanBeAliased (..)
@@ -21,7 +19,7 @@ module Futhark.Representation.AST.Attributes.Aliases
        where
 
 import Control.Arrow (first)
-import Data.Monoid
+import Data.Monoid ((<>))
 import qualified Data.Set as S
 
 import Futhark.Representation.AST.Attributes (IsOp)
@@ -44,28 +42,30 @@ subExpAliases (Var v)    = vnameAliases v
 primOpAliases :: BasicOp lore -> [Names]
 primOpAliases (SubExp se) = [subExpAliases se]
 primOpAliases (Opaque se) = [subExpAliases se]
-primOpAliases (ArrayLit es _) = [mconcat $ map subExpAliases es]
+primOpAliases (ArrayLit _ _) = [mempty]
 primOpAliases BinOp{} = [mempty]
 primOpAliases ConvOp{} = [mempty]
 primOpAliases CmpOp{} = [mempty]
 primOpAliases UnOp{} = [mempty]
 
-primOpAliases (Index _ ident _) =
+primOpAliases (Index ident _) =
   [vnameAliases ident]
+primOpAliases Update{} =
+  [mempty]
 primOpAliases Iota{} =
   [mempty]
 primOpAliases Replicate{} =
   [mempty]
+primOpAliases (Repeat _ _ v) =
+  [vnameAliases v]
 primOpAliases Scratch{} =
   [mempty]
-primOpAliases (Reshape _ _ e) =
+primOpAliases (Reshape _ e) =
   [vnameAliases e]
-primOpAliases (Rearrange _ _ e) =
+primOpAliases (Rearrange _ e) =
   [vnameAliases e]
-primOpAliases (Rotate _ _ e) =
+primOpAliases (Rotate _ e) =
   [vnameAliases e]
-primOpAliases (Split _ _ sizeexps e) =
-  replicate (length sizeexps) (vnameAliases e)
 primOpAliases Concat{} =
   [mempty]
 primOpAliases Copy{} =
@@ -74,8 +74,6 @@ primOpAliases Manifest{} =
   [mempty]
 primOpAliases Assert{} =
   [mempty]
-primOpAliases (Partition _ n _ arr) =
-  replicate n mempty ++ map vnameAliases arr
 
 ifAliases :: ([Names], Names) -> ([Names], Names) -> [Names]
 ifAliases (als1,cons1) (als2,cons2) =
@@ -88,22 +86,23 @@ funcallAliases args t =
   returnAliases t [(subExpAliases se, d) | (se,d) <- args ]
 
 expAliases :: (Aliased lore) => Exp lore -> [Names]
-expAliases (If _ tb fb _) =
-  ifAliases
-  (bodyAliases tb, consumedInBody tb)
-  (bodyAliases fb, consumedInBody fb)
+expAliases (If _ tb fb attr) =
+  drop (length all_aliases - length ts) all_aliases
+  where ts = ifReturns attr
+        all_aliases = ifAliases
+                      (bodyAliases tb, consumedInBody tb)
+                      (bodyAliases fb, consumedInBody fb)
 expAliases (BasicOp op) = primOpAliases op
 expAliases (DoLoop ctxmerge valmerge _ loopbody) =
   map (`S.difference` merge_names) val_aliases
   where (_ctx_aliases, val_aliases) =
           splitAt (length ctxmerge) $ bodyAliases loopbody
-        merge_names = S.fromList $
-                      map (paramName . fst) $ ctxmerge ++ valmerge
-expAliases (Apply _ args t) =
+        merge_names = S.fromList $ map (paramName . fst) $ ctxmerge ++ valmerge
+expAliases (Apply _ args t _) =
   funcallAliases args $ retTypeValues t
 expAliases (Op op) = opAliases op
 
-returnAliases :: [TypeBase shaper Uniqueness] -> [(Names, Diet)] -> [Names]
+returnAliases :: [TypeBase shape Uniqueness] -> [(Names, Diet)] -> [Names]
 returnAliases rts args = map returnType' rts
   where returnType' (Array _ _ Nonunique) =
           mconcat $ map (uncurry maskAliases) args
@@ -116,40 +115,31 @@ returnAliases rts args = map returnType' rts
 
 maskAliases :: Names -> Diet -> Names
 maskAliases _   Consume = mempty
+maskAliases _   ObservePrim = mempty
 maskAliases als Observe = als
 
 consumedInStm :: Aliased lore => Stm lore -> Names
-consumedInStm binding = consumedInPattern (bindingPattern binding) <>
-                            consumedInExp (bindingExp binding)
+consumedInStm = consumedInExp . stmExp
 
 consumedInExp :: (Aliased lore) => Exp lore -> Names
-consumedInExp (Apply _ args _) =
+consumedInExp (Apply _ args _ _) =
   mconcat (map (consumeArg . first subExpAliases) args)
   where consumeArg (als, Consume) = als
-        consumeArg (_,   Observe) = mempty
+        consumeArg _              = mempty
 consumedInExp (If _ tb fb _) =
   consumedInBody tb <> consumedInBody fb
 consumedInExp (DoLoop _ merge _ _) =
   mconcat (map (subExpAliases . snd) $
            filter (unique . paramDeclType . fst) merge)
+consumedInExp (BasicOp (Update src _ _)) = S.singleton src
 consumedInExp (Op op) = consumedInOp op
 consumedInExp _ = mempty
 
 consumedByLambda :: Aliased lore => Lambda lore -> Names
 consumedByLambda = consumedInBody . lambdaBody
 
-consumedByExtLambda :: Aliased lore => ExtLambda lore -> Names
-consumedByExtLambda = consumedInBody . extLambdaBody
-
 patternAliases :: AliasesOf attr => PatternT attr -> [Names]
 patternAliases = map (aliasesOf . patElemAttr) . patternElements
-
-consumedInPattern :: PatternT attr -> Names
-consumedInPattern pat =
-  mconcat (map (consumedInBindage . patElemBindage) $
-           patternContextElements pat ++ patternValueElements pat)
-  where consumedInBindage BindVar = mempty
-        consumedInBindage (BindInPlace _ src _) = vnameAliases src
 
 -- | Something that contains alias information.
 class AliasesOf a where

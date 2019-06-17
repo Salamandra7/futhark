@@ -2,6 +2,7 @@
 -- for ICFP 2016.
 --
 -- ==
+-- tags { no_opencl }
 -- input {
 --   [[1,2,3],[3,2,1],[4,5,6]]
 -- }
@@ -21,18 +22,19 @@
 -- }
 -- structure distributed {
 --   DoLoop/Kernel 1
---   Kernel 7
+--   Kernel 2
+--   SegRed 1
 -- }
 
-let main(pss: [#n][#m]i32): ([n][m][m]i32, [n][m]i32) =
+let main [n][m] (pss: [n][m]i32): ([n][m][m]i32, [n][m]i32) =
   let (asss, bss) =
     unzip(map (\(ps: []i32): ([m][m]i32, [m]i32)  ->
                 let ass = map (\(p: i32): [m]i32  ->
-                                let cs = scan (+) 0 (iota(p))
+                                let cs = scan (+) 0 (0..1..<p)
                                 let f = reduce (+) 0 cs
                                 let as = map (+f) ps
                                 in as) ps
-                loop (bs=ps) = for i < n do
+                let bs' = loop bs=ps for i < n do
                   let bs' = map (\(as: []i32, b: i32): i32  ->
                                   let d = reduce (+) 0 as
                                   let e = d + b
@@ -40,5 +42,5 @@ let main(pss: [#n][#m]i32): ([n][m][m]i32, [n][m]i32) =
                                   in b') (
                                 zip ass bs)
                   in bs'
-                in (ass, bs)) pss)
+                in (ass, bs')) pss)
   in (asss, bss)

@@ -3,10 +3,15 @@
 Installation
 ============
 
-There are two ways to install the Futhark compiler: using a
+There are two main ways to install the Futhark compiler: using a
 precompiled tarball or compiling from source.  Both methods are
-discussed below.  If you are using Windows, make sure to read
-:ref:`windows-installation`.
+discussed below.  If you are using Linux, see
+:ref:`linux-installation`.  If you are using Windows, make sure to
+read :ref:`windows-installation`.  If you are using macOS, read
+:ref:`macos-installation`.
+
+Futhark is also available via `Nix <https://nixos.org/nix/>`_.  If you
+are using Nix, simply install the ``futhark`` derivation from Nixpkgs.
 
 Compiling from source
 ---------------------
@@ -18,11 +23,11 @@ documentation about `installing Stack`_ on a multitude of operating
 systems.  If you're lucky, it may even be in your local package
 repository.
 
-We do not presently issue source releases of Futhark, so the only way
-to compile from source is to perform a checkout of our Git
-repository::
+You can either retrieve a `source release tarball
+<https://github.com/diku-dk/futhark/releases>`_ or perform a checkout
+of our Git repository::
 
-  $ git clone https://github.com/HIPERFIT/futhark.git
+  $ git clone https://github.com/diku-dk/futhark.git
 
 This will create a directory ``futhark``, which you must enter::
 
@@ -41,8 +46,13 @@ dependencies::
 
   $ stack build
 
-The Futhark compiler and its tools will now be built. You can copy
-them to your ``$HOME/.local/bin`` directory by running::
+The Futhark compiler and its tools will now be built.  This step
+typically requires at least 8GiB of memory.  You may be able to build
+it on a smaller machine by adding the ``--fast`` option, although the
+resulting Futhark compiler binary will run slower.
+
+After building, you can copy the binaries to your ``$HOME/.local/bin``
+directory by running::
 
   $ stack install
 
@@ -51,13 +61,19 @@ Note that this does not install the Futhark manual pages.
 Installing from a precompiled snapshot
 --------------------------------------
 
-We do not yet have any proper releases as such, but every day a
-program automatically clones the Git repository, builds the compiler,
-and packages a simple tarball containing the resulting binaries, built
-manpages, and a simple ``Makefile`` for installing.  The implication
-is that these tarballs are not vetted in any way, nor more stable than
-Git HEAD at any particular moment in time.  They are provided merely
-for users who are unable or unwilling to compile Futhark themselves.
+Tarballs of binary releases can be `found online
+<https://futhark-lang.org/releases/>`_, but are available only for
+very few platforms (as of this writing, only GNU/Linux on x86_64).
+See the enclosed ``README.md`` for installation instructions.
+
+Furthermore, every day a program automatically clones the Git
+repository, builds the compiler, and packages a simple tarball
+containing the resulting binaries, built manpages, and a simple
+``Makefile`` for installing.  The implication is that these tarballs
+are not vetted in any way, nor more stable than Git HEAD at any
+particular moment in time.  They are provided for users who wish to
+use the most recent code, but are unable to compile Futhark
+themselves.
 
 At the moment, we build such snapshots only for a single operating
 system:
@@ -66,15 +82,69 @@ Linux (x86_64)
   `futhark-nightly-linux-x86_64.tar.xz <https://futhark-lang.org/releases/futhark-nightly-linux-x86_64.tar.xz>`_
 
 In time, we hope to make snapshots available for more platforms, but
-we are limited by system availability.  We also intend to make proper
-releases once the language matures.
+we are limited by system availability.
 
 .. _`Haskell tool stack`: http://docs.haskellstack.org/
 .. _`installing Stack`: http://docs.haskellstack.org/#how-to-install
 
+.. _linux-installation:
+
+Installing Futhark on Linux
+---------------------------
+
+* `Linuxbrew`_ is a distribution-agnostic package manager that
+  contains a formula for Futhark.  If Linuxbrew is installed (which
+  does not require ``root`` access), installation is as easy as::
+
+    $ brew install futhark
+
+  Note that as of this writing, Linuxbrew is hampered by limited
+  compute resources for building packages, so the Futhark version may
+  be a bit behind.
+
+* Arch Linux users can use a `futhark-nightly package
+  <https://aur.archlinux.org/packages/futhark-nightly/>`_.
+
+Otherwise (or if the version in the package system is too old), your
+best bet is to install from source or use a tarball, as described
+above.
+
+.. _`Linuxbrew`: http://linuxbrew.sh/
+
+.. _macos-installation:
+
+Installing Futhark on macOS
+---------------------------
+
+Futhark is available on `Homebrew`_, and the latest release can be
+installed via::
+
+  $ brew install futhark
+
+Or you can install the unreleased development version with::
+
+  $ brew install --HEAD futhark
+
+This has to compile from source, so it takes a little while (20-30
+minutes is common).
+
+macOS ships with one OpenCL platform and various devices.  One of
+these devices is always the CPU, which is not fully functional, and is
+never picked by Futhark by default.  You can still select it manually
+with the usual mechanisms (see :ref:`executable-options`), but it is
+unlikely to be able to run most Futhark programs.  Depending on the
+system, there may also be one or more GPU devices, and Futhark will
+simply pick the first one as always.  On multi-GPU MacBooks, this is
+is the low-power integrated GPU.  It should work just fine, but you
+might have better performance if you use the dedicated GPU instead.
+On a Mac with an AMD GPU, this is done by passing ``-dAMD`` to the
+generated Futhark executable.
+
+.. _`Homebrew`: https://brew.sh/
+
 .. _windows-installation:
 
-Installing Futhark on Windows
+Setting up Futhark on Windows
 -----------------------------
 
 While the Futhark compiler itself is easily installed on Windows via
@@ -144,11 +214,11 @@ Setting up Futhark and OpenCL
 
    The CUDA distribution also comes with the static ``OpenCL.lib``, but
    trying to use that one instead of the ``OpenCL64.dll`` will cause
-   programs compiled with ``futhark-opencl`` to crash, so ignore it
+   programs compiled with ``futhark opencl`` to crash, so ignore it
    completely.
 
-Now you should be able to compile ``futhark-opencl`` and run Futhark
-programs on the GPU.
+Now you should be able to compile with ``futhark opencl`` and run
+Futhark programs on the GPU.
 
 Congratulations!
 
@@ -212,7 +282,7 @@ If everything went in order, pyOpenCL should be installed on your machine now.
     install pygame-1.9.2a0-cp27-none-win_amd64.whl`` from the command
     line.
 
-Now you should be able to run the `Mandelbrot Explorer`_ and and `Game of Life`_ examples.
+Now you should be able to run the `Game of Life`_ example.
 
 11) To run the makefiles, first setup ``make`` by going to the ``bin``
     directory of MingWpy and making a copy of
@@ -230,6 +300,5 @@ Now you should be able to run the `Mandelbrot Explorer`_ and and `Game of Life`_
     it.
 
 .. _`PyOpenCL repository`: https://github.com/pyopencl/pyopencl
-.. _`Mandelbrot Explorer`: https://github.com/HIPERFIT/futhark-benchmarks/tree/master/misc/mandelbrot-explorer
-.. _`Game of Life`: https://github.com/HIPERFIT/futhark-benchmarks/tree/master/misc/life
-.. _`issues page`: https://github.com/HIPERFIT/futhark/issues
+.. _`Game of Life`: https://github.com/diku-dk/futhark-benchmarks/tree/master/misc/life
+.. _`issues page`: https://github.com/diku-dk/futhark/issues

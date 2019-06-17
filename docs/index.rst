@@ -7,14 +7,20 @@ Futhark User's Guide
 ====================
 
 Welcome to the documentation for the Futhark compiler and language.
-For a basic introduction, please see `our website
+For a basic introduction, please see `the Futhark website
 <http://futhark-lang.org>`_.  To get started, read the page on
 :ref:`installation`.  Once the compiler has been installed, you might
-want to take a look at :ref:`language-overview` or
-:ref:`c-porting-guide`.  Additional documentation can also be found in
-our `publications`_.
+want to take a look at :ref:`usage`.  This User's Guide contains a
+:ref:`language-reference`, but new Futhark programmers are probably
+better served by reading `Parallel Programming in Futhark
+<https://futhark-book.readthedocs.io>`_ first.
 
-.. _`publications`: http://futhark-lang.org/docs.html#publications
+Documentation for the included basis library is also `available online
+<https://futhark-lang.org/docs/>`_.
+
+The particularly interested reader may also want to peruse the
+`publications <https://futhark-lang.org/docs.html#publications>`_, or
+the `development blog <https://futhark-lang.org/blog.html>`_.
 
 .. toctree::
    :caption: Table of Contents
@@ -23,9 +29,10 @@ our `publications`_.
 
    installation.rst
    usage.rst
-   language-overview.rst
    language-reference.rst
+   package-management.rst
    c-porting-guide.rst
+   versus-other-languages.rst
    hacking.rst
    binary-data-format.rst
 
@@ -36,9 +43,15 @@ our `publications`_.
    man/futhark.rst
    man/futhark-c.rst
    man/futhark-opencl.rst
-   man/futhark-py.rst
+   man/futhark-cuda.rst
+   man/futhark-python.rst
    man/futhark-pyopencl.rst
-   man/futharki.rst
+   man/futhark-csharp.rst
+   man/futhark-csopencl.rst
+   man/futhark-run.rst
+   man/futhark-repl.rst
    man/futhark-test.rst
    man/futhark-bench.rst
+   man/futhark-doc.rst
    man/futhark-dataset.rst
+   man/futhark-pkg.rst

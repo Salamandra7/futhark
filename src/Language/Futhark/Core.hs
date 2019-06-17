@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 -- | This module contains very basic definitions for Futhark - so basic,
 -- that they can be shared between the internal and external
 -- representation.
@@ -30,15 +32,11 @@ module Language.Futhark.Core
 
 where
 
-import Data.Monoid
-import Data.Hashable
 import Data.Int (Int8, Int16, Int32, Int64)
+import Data.String
 import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Loc
-import Data.List
 import qualified Data.Text as T
-
-import Prelude
 
 import Futhark.Util.Pretty
 
@@ -49,19 +47,15 @@ data Uniqueness = Nonunique -- ^ May have references outside current function.
                 | Unique    -- ^ No references outside current function.
                   deriving (Eq, Ord, Show)
 
+instance Semigroup Uniqueness where
+  (<>) = min
+
 instance Monoid Uniqueness where
   mempty = Unique
-  _ `mappend` Nonunique = Nonunique
-  Nonunique `mappend` _ = Nonunique
-  u `mappend` _         = u
 
 instance Pretty Uniqueness where
   ppr Unique = star
   ppr Nonunique = empty
-
-instance Hashable Uniqueness where
-  hashWithSalt salt Unique    = salt
-  hashWithSalt salt Nonunique = salt * 2
 
 data StreamOrd  = InOrder
                 | Disorder
@@ -73,9 +67,11 @@ data Commutativity = Noncommutative
                    | Commutative
                      deriving (Eq, Ord, Show)
 
+instance Semigroup Commutativity where
+  (<>) = min
+
 instance Monoid Commutativity where
   mempty = Commutative
-  mappend = min
 
 -- | The name of the default program entry point (main).
 defaultEntryPoint :: Name
@@ -85,17 +81,10 @@ defaultEntryPoint = nameFromString "main"
 -- compiler.  'String's, being lists of characters, are very slow,
 -- while 'T.Text's are based on byte-arrays.
 newtype Name = Name T.Text
-  deriving (Show, Eq, Ord)
+  deriving (Show, Eq, Ord, IsString, Semigroup)
 
 instance Pretty Name where
   ppr = text . nameToString
-
-instance Hashable Name where
-  hashWithSalt salt (Name t) = hashWithSalt salt t
-
-instance Monoid Name where
-  Name t1 `mappend` Name t2 = Name $ t1 <> t2
-  mempty = Name mempty
 
 -- | Convert a name to the corresponding list of characters.
 nameToString :: Name -> String
@@ -114,14 +103,21 @@ nameFromText :: T.Text -> Name
 nameFromText = Name
 
 -- | A human-readable location string, of the form
--- @filename:lineno:columnno@.
+-- @filename:lineno:columnno@.  This follows the GNU coding standards
+-- for error messages:
+-- https://www.gnu.org/prep/standards/html_node/Errors.html
+--
+-- This function assumes that both start and end position is in the
+-- same file (it is not clear what the alternative would even mean).
 locStr :: SrcLoc -> String
 locStr (SrcLoc NoLoc) = "unknown location"
-locStr (SrcLoc (Loc (Pos file line1 col1 _) (Pos _ line2 col2 _))) =
-  -- Assume that both positions are in the same file (what would the
-  -- alternative mean?)
-  file ++ ":" ++ show line1 ++ ":" ++ show col1
-       ++ "-" ++ show line2 ++ ":" ++ show col2
+locStr (SrcLoc (Loc (Pos file line1 col1 _) (Pos _ line2 col2 _)))
+  -- Do not show line2 if it is identical to line1.
+  | line1 == line2 =
+      first_part ++ "-" ++ show col2
+  | otherwise =
+      first_part ++ "-" ++ show line2 ++ ":" ++ show col2
+  where first_part = file ++ ":" ++ show line1 ++ ":" ++ show col1
 
 -- | A name tagged with some integer.  Only the integer is used in
 -- comparisons, no matter the type of @vn@.
@@ -145,9 +141,3 @@ instance Eq VName where
 
 instance Ord VName where
   VName _ x `compare` VName _ y = x `compare` y
-
-instance Pretty VName where
-  ppr (VName vn i) = ppr vn <> text "_" <> text (show i)
-
-instance Hashable VName where
-  hashWithSalt salt (VName _ i) = salt * i

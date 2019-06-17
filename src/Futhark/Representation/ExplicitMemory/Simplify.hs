@@ -1,4 +1,3 @@
-{-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -6,21 +5,18 @@
 {-# LANGUAGE ConstraintKinds #-}
 module Futhark.Representation.ExplicitMemory.Simplify
        ( simplifyExplicitMemory
+       , simplifyStms
        )
 where
 
 import Control.Monad
 import qualified Data.Set as S
-import Data.Monoid
-import Data.Maybe
-
-import Prelude
+import Data.List
 
 import qualified Futhark.Representation.AST.Syntax as AST
 import Futhark.Representation.AST.Syntax
   hiding (Prog, BasicOp, Exp, Body, Stm,
-          Pattern, PatElem, Lambda, ExtLambda, FunDef, FParam, LParam,
-          RetType)
+          Pattern, PatElem, Lambda, FunDef, FParam, LParam, RetType)
 import Futhark.Representation.ExplicitMemory
 import Futhark.Representation.Kernels.Simplify
   (simplifyKernelOp, simplifyKernelExp)
@@ -28,24 +24,30 @@ import Futhark.Pass.ExplicitAllocations
   (simplifiable, arraySizeInBytesExp)
 import qualified Futhark.Analysis.SymbolTable as ST
 import qualified Futhark.Analysis.UsageTable as UT
-import qualified Futhark.Optimise.Simplifier.Engine as Engine
-import qualified Futhark.Optimise.Simplifier as Simplifier
+import qualified Futhark.Optimise.Simplify.Engine as Engine
+import qualified Futhark.Optimise.Simplify as Simplify
 import Futhark.Construct
-import Futhark.Optimise.Simplifier.Rules
-import Futhark.Optimise.Simplifier.RuleM
-import Futhark.Optimise.Simplifier.Rule
-import Futhark.Optimise.Simplifier.Lore
-import Futhark.MonadFreshNames
+import Futhark.Pass
+import Futhark.Optimise.Simplify.Rules
+import Futhark.Optimise.Simplify.Rule
+import Futhark.Optimise.Simplify.Lore
+import Futhark.Util
 
-simpleExplicitMemory :: Simplifier.SimpleOps ExplicitMemory
+simpleExplicitMemory :: Simplify.SimpleOps ExplicitMemory
 simpleExplicitMemory = simplifiable (simplifyKernelOp simpleInKernel inKernelEnv)
 
-simpleInKernel :: Simplifier.SimpleOps InKernel
-simpleInKernel = simplifiable simplifyKernelExp
+simpleInKernel :: KernelSpace -> Simplify.SimpleOps InKernel
+simpleInKernel = simplifiable . simplifyKernelExp
 
-simplifyExplicitMemory :: MonadFreshNames m => Prog ExplicitMemory -> m (Prog ExplicitMemory)
+simplifyExplicitMemory :: Prog ExplicitMemory -> PassM (Prog ExplicitMemory)
 simplifyExplicitMemory =
-  Simplifier.simplifyProgWithRules simpleExplicitMemory callKernelRules blockers
+  Simplify.simplifyProg simpleExplicitMemory callKernelRules
+  blockers { Engine.blockHoistBranch = isAlloc }
+
+simplifyStms :: (HasScope ExplicitMemory m, MonadFreshNames m) =>
+                Stms ExplicitMemory -> m (Stms ExplicitMemory)
+simplifyStms =
+  Simplify.simplifyStms simpleExplicitMemory callKernelRules blockers
 
 isAlloc :: Op lore ~ MemOp op => Engine.BlockPred lore
 isAlloc _ (Let _ _ (Op Alloc{})) = True
@@ -58,94 +60,79 @@ isResultAlloc _ _ = False
 
 -- | Getting the roots of what to hoist, for now only variable
 -- names that represent array and memory-block sizes.
-getShapeNames :: ExplicitMemorish lore =>
+getShapeNames :: (ExplicitMemorish lore, Op lore ~ MemOp op) =>
                  Stm (Wise lore) -> S.Set VName
-getShapeNames bnd =
-  let tps = map patElemType $ patternElements $ bindingPattern bnd
-      ats = map (snd . patElemAttr) $ patternElements $ bindingPattern bnd
-      nms = mapMaybe (\attr -> case attr of
-                                 MemMem (Var nm) _   -> Just nm
-                                 ArrayMem _ _ _ nm _ -> Just nm
-                                 _                   -> Nothing
-                     ) ats
-  in  S.fromList $ nms ++ subExpVars (concatMap arrayDims tps)
+getShapeNames stm =
+  let ts = map patElemType $ patternElements $ stmPattern stm
+  in freeIn (concatMap arrayDims ts) <>
+     case stmExp stm of Op (Alloc size _) -> freeIn size
+                        _                 -> mempty
 
 isAlloc0 :: Op lore ~ MemOp op => AST.Stm lore -> Bool
 isAlloc0 (Let _ _ (Op Alloc{})) = True
 isAlloc0 _                      = False
 
-inKernelEnv :: Engine.Env (Engine.SimpleM InKernel)
+inKernelEnv :: Engine.Env InKernel
 inKernelEnv = Engine.emptyEnv inKernelRules blockers
 
 blockers ::  (ExplicitMemorish lore, Op lore ~ MemOp op) =>
-             Simplifier.HoistBlockers (Engine.SimpleM lore)
-blockers = Engine.HoistBlockers {
-    Engine.blockHoistPar = isAlloc
-  , Engine.blockHoistSeq = isResultAlloc
-  , Engine.getArraySizes = getShapeNames
-  , Engine.isAllocation  = isAlloc0
+             Simplify.HoistBlockers lore
+blockers = Engine.noExtraHoistBlockers {
+    Engine.blockHoistPar    = isAlloc
+  , Engine.blockHoistSeq    = isResultAlloc
+  , Engine.getArraySizes    = getShapeNames
+  , Engine.isAllocation     = isAlloc0
   }
 
-
-callKernelRules :: (MonadBinder m,
-                    LetAttr (Lore m) ~ (VarWisdom, MemBound u),
-                    Lore m ~ Wise lore,
-                    ExplicitMemorish lore) => RuleBook m
+callKernelRules :: RuleBook (Wise ExplicitMemory)
 callKernelRules = standardRules <>
-                  RuleBook [copyCopyToCopy] []
+                  ruleBook [RuleBasicOp copyCopyToCopy,
+                            RuleBasicOp removeIdentityCopy] []
 
-inKernelRules :: (MonadBinder m,
-                  LetAttr (Lore m) ~ (VarWisdom, MemBound u),
-                  OpWithWisdom (Op lore) ~ MemOp inner,
-                  Lore m ~ Wise lore,
-                  ExplicitMemorish lore) => RuleBook m
+inKernelRules :: RuleBook (Wise InKernel)
 inKernelRules = standardRules <>
-                RuleBook [copyCopyToCopy, unExistentialiseMemory] []
+                ruleBook [RuleBasicOp copyCopyToCopy,
+                          RuleBasicOp removeIdentityCopy,
+                          RuleIf unExistentialiseMemory] []
 
--- | If a branch is returning some existential memory, but we know the
--- size of the corresponding array non-existentially, then we can
--- create a block of the proper size and always return there.
-unExistentialiseMemory :: (MonadBinder m,
-                           Op (Lore m) ~ MemOp inner,
-                           LetAttr (Lore m) ~ (VarWisdom, MemBound u)) =>
-                          TopDownRule m
-unExistentialiseMemory _ (Let pat _ (If cond tbranch fbranch ret))
-  | (remaining_ctx, concretised) <-
-      foldl hasConcretisableMemory
-      (patternContextElements pat, mempty)
-      (patternValueElements pat),
-    not $ null concretised = do
+-- | If a branch is returning some existential memory, but the size of
+-- the array is not existential, then we can create a block of the
+-- proper size and always return there.
+unExistentialiseMemory :: TopDownRuleIf (Wise InKernel)
+unExistentialiseMemory _ pat _ (cond, tbranch, fbranch, ifattr)
+  | fixable <- foldl hasConcretisableMemory mempty $ patternElements pat,
+    not $ null fixable = do
 
       -- Create non-existential memory blocks big enough to hold the
       -- arrays.
-      forM_ concretised $ \(pat_elem, (mem, size, space)) -> do
-        case size of
-          Constant{} ->
-            return ()
-          Var size_v ->
-            letBindNames'_ [size_v] =<<
-            toExp (arraySizeInBytesExp $ patElemType pat_elem)
-        letBindNames'_ [mem] $ Op $ Alloc size space
+      (arr_to_mem, oldmem_to_mem) <-
+        fmap unzip $ forM fixable $ \(arr_pe, oldmem, space) -> do
+          size <- letSubExp "size" =<<
+                  toExp (arraySizeInBytesExp $ patElemType arr_pe)
+          mem <- letExp "mem" $ Op $ Alloc size space
+          return ((patElemName arr_pe, mem), (oldmem, mem))
 
       -- Update the branches to contain Copy expressions putting the
       -- arrays where they are expected.
       let updateBody body = insertStmsM $ do
             res <- bodyBind body
             resultBodyM =<<
-              zipWithM updateResult (patternValueElements pat) res
+              zipWithM updateResult (patternElements pat) res
           updateResult pat_elem (Var v)
-            | Just _ <- lookup pat_elem concretised = do
-                v_copy <- newVName $ pretty v <> "_copy"
-                letBind_ (Pattern [] [PatElem v_copy BindVar $ patElemAttr pat_elem]) $
-                  BasicOp $ Copy v
+            | Just mem <- lookup (patElemName pat_elem) arr_to_mem,
+              (_, MemArray pt shape u (ArrayIn _ ixfun)) <- patElemAttr pat_elem = do
+                v_copy <- newVName $ baseString v <> "_nonext_copy"
+                let v_pat = Pattern [] [PatElem v_copy $
+                                        MemArray pt shape u $ ArrayIn mem ixfun]
+                addStm $ mkWiseLetStm v_pat (defAux ()) $ BasicOp (Copy v)
                 return $ Var v_copy
+            | Just mem <- lookup (patElemName pat_elem) oldmem_to_mem =
+                return $ Var mem
           updateResult _ se =
             return se
       tbranch' <- updateBody tbranch
       fbranch' <- updateBody fbranch
-
-      letBind_ pat { patternContextElements = remaining_ctx} $
-        If cond tbranch' fbranch' ret
+      letBind_ pat $ If cond tbranch' fbranch' ifattr
   where onlyUsedIn name here = not $ any ((name `S.member`) . freeIn) $
                                           filter ((/=here) . patElemName) $
                                           patternValueElements pat
@@ -153,59 +140,61 @@ unExistentialiseMemory _ (Let pat _ (If cond tbranch fbranch ret))
         knownSize (Var v) = not $ inContext v
         inContext = (`elem` patternContextNames pat)
 
-        hasConcretisableMemory (ctx, concretised) pat_elem
-          | (_, ArrayMem _ shape _ mem _) <- patElemAttr pat_elem,
-            all knownSize (shapeDims shape),
+        hasConcretisableMemory fixable pat_elem
+          | (_, MemArray _ shape _ (ArrayIn mem _)) <- patElemAttr pat_elem,
+            Just (j, Mem space) <-
+              fmap patElemType <$> find ((mem==) . patElemName . snd)
+                                        (zip [(0::Int)..] $ patternElements pat),
+            Just tse <- maybeNth j $ bodyResult tbranch,
+            Just fse <- maybeNth j $ bodyResult fbranch,
             mem `onlyUsedIn` patElemName pat_elem,
-            Just (size, space, ctx') <- getMemFromContext mem ctx,
-            let concretised' = (pat_elem, (mem, size, space)) : concretised =
-              case size of
-                Constant{} ->
-                  (ctx',
-                   concretised')
-                Var size_v | size_v `onlyUsedIn` mem ->
-                  (filter ((/=size_v) . patElemName) ctx',
-                   concretised')
-                _ ->
-                  (ctx,
-                   concretised)
+            all knownSize (shapeDims shape),
+            fse /= tse =
+              (pat_elem, mem, space) : fixable
           | otherwise =
-              (ctx, concretised)
-
-        getMemFromContext _ [] = Nothing
-        getMemFromContext mem (PatElem name _ (_, MemMem size space) : ctx)
-          | name == mem = Just (size, space, ctx)
-        getMemFromContext mem (pat_elem : ctx) = do
-          (size, space, ctx') <- getMemFromContext mem ctx
-          return (size, space, pat_elem : ctx')
-
-unExistentialiseMemory _ _ = cannotSimplify
+              fixable
+unExistentialiseMemory _ _ _ _ = cannotSimplify
 
 -- | If we are copying something that is itself a copy, just copy the
 -- original one instead.
-copyCopyToCopy :: (MonadBinder m,
-                   LetAttr (Lore m) ~ (VarWisdom, MemBound u)) =>
-                  TopDownRule m
-copyCopyToCopy vtable (Let pat@(Pattern [] [pat_elem]) _ (BasicOp (Copy v1)))
-  | Just (BasicOp (Copy v2)) <- ST.lookupExp v1 vtable,
+copyCopyToCopy :: (BinderOps lore,
+                   LetAttr lore ~ (VarWisdom, MemBound u)) =>
+                  TopDownRuleBasicOp lore
+copyCopyToCopy vtable pat@(Pattern [] [pat_elem]) _ (Copy v1)
+  | Just (BasicOp (Copy v2), v1_cs) <- ST.lookupExp v1 vtable,
 
-    Just (_, ArrayMem _ _ _ srcmem src_ixfun) <-
+    Just (_, MemArray _ _ _ (ArrayIn srcmem src_ixfun)) <-
       ST.entryLetBoundAttr =<< ST.lookup v1 vtable,
 
-    Just (Mem _ src_space) <- ST.lookupType srcmem vtable,
+    Just (Mem src_space) <- ST.lookupType srcmem vtable,
 
-    (_, ArrayMem _ _ _ destmem dest_ixfun) <- patElemAttr pat_elem,
+    (_, MemArray _ _ _ (ArrayIn destmem dest_ixfun)) <- patElemAttr pat_elem,
 
-    Just (Mem _ dest_space) <- ST.lookupType destmem vtable,
+    Just (Mem dest_space) <- ST.lookupType destmem vtable,
 
     src_space == dest_space, dest_ixfun == src_ixfun =
 
-      letBind_ pat $ BasicOp $ Copy v2
+      certifying v1_cs $ letBind_ pat $ BasicOp $ Copy v2
 
-copyCopyToCopy vtable (Let pat _ (BasicOp (Copy v0)))
-  | Just (BasicOp (Rearrange cs perm v1)) <- ST.lookupExp v0 vtable,
-    Just (BasicOp (Copy v2)) <- ST.lookupExp v1 vtable = do
-      v0' <- letExp "rearrange_v0" $ BasicOp $ Rearrange cs perm v2
+copyCopyToCopy vtable pat _ (Copy v0)
+  | Just (BasicOp (Rearrange perm v1), v0_cs) <- ST.lookupExp v0 vtable,
+    Just (BasicOp (Copy v2), v1_cs) <- ST.lookupExp v1 vtable = do
+      v0' <- certifying (v0_cs<>v1_cs) $
+             letExp "rearrange_v0" $ BasicOp $ Rearrange perm v2
       letBind_ pat $ BasicOp $ Copy v0'
 
-copyCopyToCopy _ _ = cannotSimplify
+copyCopyToCopy _ _ _ _ = cannotSimplify
+
+-- | If the destination of a copy is the same as the source, just
+-- remove it.
+removeIdentityCopy :: (BinderOps lore,
+                       LetAttr lore ~ (VarWisdom, MemBound u)) =>
+                      TopDownRuleBasicOp lore
+removeIdentityCopy vtable pat@(Pattern [] [pe]) _ (Copy v)
+  | (_, MemArray _ _ _ (ArrayIn dest_mem dest_ixfun)) <- patElemAttr pe,
+    Just (_, MemArray _ _ _ (ArrayIn src_mem src_ixfun)) <-
+      ST.entryLetBoundAttr =<< ST.lookup v vtable,
+    dest_mem == src_mem, dest_ixfun == src_ixfun =
+      letBind_ pat $ BasicOp $ SubExp $ Var v
+
+removeIdentityCopy _ _ _ _ = cannotSimplify

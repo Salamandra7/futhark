@@ -6,9 +6,8 @@ module Futhark.Representation.AST.Syntax.CoreTests
 
 import Control.Applicative
 
-import Test.HUnit hiding (Test)
-import Test.Framework
-import Test.Framework.Providers.HUnit
+import Test.Tasty
+import Test.Tasty.HUnit
 import Test.QuickCheck
 
 import Prelude
@@ -16,12 +15,12 @@ import Prelude
 import Language.Futhark.CoreTests ()
 import Futhark.Representation.PrimitiveTests()
 import Futhark.Representation.AST.Syntax.Core
-import Futhark.Representation.AST.Pretty
+import Futhark.Representation.AST.Pretty ()
 
-tests :: [Test]
-tests = subShapeTests
+tests :: TestTree
+tests = testGroup "Internal CoreTests" subShapeTests
 
-subShapeTests :: [Test]
+subShapeTests :: [TestTree]
 subShapeTests =
   [ shape [free 1, free 2] `isSubShapeOf` shape [free 1, free 2]
   , shape [free 1, free 3] `isNotSubShapeOf` shape [free 1, free 2]
@@ -30,10 +29,10 @@ subShapeTests =
   , shape [Ext 1, Ext 2] `isNotSubShapeOf` shape [Ext 1, Ext 1]
   , shape [Ext 1, Ext 1] `isSubShapeOf` shape [Ext 1, Ext 2]
   ]
-  where shape :: [ExtDimSize] -> ExtShape
-        shape = ExtShape
+  where shape :: [ExtSize] -> ExtShape
+        shape = Shape
 
-        free :: Int -> ExtDimSize
+        free :: Int -> ExtSize
         free = Free . Constant . IntValue . Int32Value . fromIntegral
 
         isSubShapeOf shape1 shape2 =
@@ -41,7 +40,7 @@ subShapeTests =
         isNotSubShapeOf shape1 shape2 =
           subShapeTest shape1 shape2 False
 
-        subShapeTest :: ExtShape -> ExtShape -> Bool -> Test
+        subShapeTest :: ExtShape -> ExtShape -> Bool -> TestTree
         subShapeTest shape1 shape2 expected =
           testCase ("subshapeOf " ++ pretty shape1 ++ " " ++
                     pretty shape2 ++ " == " ++
@@ -57,9 +56,6 @@ instance (Arbitrary shape, Arbitrary u) => Arbitrary (TypeBase shape u) where
           , Array <$> arbitrary <*> arbitrary <*> arbitrary
           ]
 
-instance Arbitrary Value where
-  arbitrary = PrimVal <$> arbitrary
-
 instance Arbitrary Ident where
   arbitrary = Ident <$> arbitrary <*> arbitrary
 
@@ -67,5 +63,5 @@ instance Arbitrary Rank where
   arbitrary = Rank <$> elements [1..9]
 
 instance Arbitrary Shape where
-  arbitrary = Shape <$> map intconst <$> listOf1 (elements [1..9])
+  arbitrary = Shape . map intconst <$> listOf1 (elements [1..9])
     where intconst = Constant . IntValue . Int32Value

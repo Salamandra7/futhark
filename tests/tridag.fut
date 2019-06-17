@@ -41,7 +41,7 @@ let tridag(nn:   i32,
     --then ( b, map(\f64 (f64 x, f64 y) -> x / y, d, b) )
     then (b, [d[0]/b[0]])
     else
-        loop((b, d)) = for i < (nn-1) do
+        let (b,d) = loop((b, d)) for i < (nn-1) do
             let xm     = a[i+1] / b[i]
             let b[i+1] = b[i+1] - xm*c[i]
             let d[i+1] = d[i+1] - xm*d[i] in
@@ -49,18 +49,17 @@ let tridag(nn:   i32,
 
         let d[nn-1] = d[nn-1] / b[nn-1]   in
 
-        loop(d)    = for i < (nn-1) do
+        let d = loop(d) for i < (nn-1) do
             let k = nn - 2 - i
             let d[k] = ( d[k] - c[k]*d[k+1] ) / b[k] in
             d
-        in
-            (b, d)
+        in (b, d)
 
 
-let main(): ([]f64,[]f64) =
+let main: ([]f64,[]f64) =
     let nn = reduce (+) 0 ([1,2,3,4])
     let a = replicate nn 3.33
-    let b = map (\(x: i32): f64  -> f64(x) + 1.0) (iota(nn))
-    let c = map (\(x: i32): f64  -> 1.11*f64(x) + 0.5) (iota(nn))
-    let d = map (\(x: i32): f64  -> 1.01*f64(x) + 0.25) (iota(nn)) in
+    let b = map (\x -> r64(x) + 1.0) (iota(nn))
+    let c = map (\x -> 1.11*r64(x) + 0.5) (iota(nn))
+    let d = map (\x -> 1.01*r64(x) + 0.25) (iota(nn)) in
         tridag(nn, b, d, a, c)

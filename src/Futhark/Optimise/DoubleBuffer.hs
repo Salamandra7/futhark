@@ -4,6 +4,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 -- | The simplification engine is only willing to hoist allocations
 -- out of loops if the memory block resulting from the allocation is
 -- dead at the end of the loop.  If it is not, we may cause data
@@ -24,7 +25,6 @@ module Futhark.Optimise.DoubleBuffer
        ( doubleBuffer )
        where
 
-import           Control.Applicative
 import           Control.Monad.State
 import           Control.Monad.Writer
 import           Control.Monad.Reader
@@ -33,15 +33,15 @@ import qualified Data.Set as S
 import           Data.Maybe
 import           Data.List
 
-import           Prelude
-
-import           Futhark.MonadFreshNames
-import           Futhark.Tools (intraproceduralTransformation)
+import           Futhark.Construct
 import           Futhark.Representation.AST
+import           Futhark.Pass.ExplicitAllocations (arraySizeInBytesExp)
+import qualified Futhark.Representation.ExplicitMemory.IndexFunction as IxFun
 import           Futhark.Representation.ExplicitMemory
                  hiding (Prog, Body, Stm, Pattern, PatElem,
-                         BasicOp, Exp, Lambda, ExtLambda, FunDef, FParam, LParam, RetType)
+                         BasicOp, Exp, Lambda, FunDef, FParam, LParam, RetType)
 import           Futhark.Pass
+import           Futhark.Util (maybeHead)
 
 doubleBuffer :: Pass ExplicitMemory ExplicitMemory
 doubleBuffer =
@@ -56,19 +56,18 @@ doubleBuffer =
 -- Thus, the environment is parametrised by the lore and contains the
 -- function used to transform 'Op's for the lore.
 
-optimiseFunDef :: MonadFreshNames m => FunDef ExplicitMemory -> m (FunDef ExplicitMemory)
-optimiseFunDef fundec = do
-  body' <- runReaderT (runDoubleBufferM $ inScopeOf fundec $
-                       optimiseBody $ funDefBody fundec) $
-           Env emptyScope optimiseKernelOp False
-  return fundec { funDefBody = body' }
-  where emptyScope :: Scope ExplicitMemory
-        emptyScope = mempty
+optimiseFunDef :: FunDef ExplicitMemory -> PassM (FunDef ExplicitMemory)
+optimiseFunDef fundec = modifyNameSource $ \src ->
+  let m = runDoubleBufferM $ inScopeOf fundec $ optimiseBody $ funDefBody fundec
+      (body', src') = runState (runReaderT m env) src
+  in (fundec { funDefBody = body' }, src')
+  where env = Env mempty optimiseKernelOp doNotTouchLoop
 
-        optimiseKernelOp (Inner k) = do
+        optimiseKernelOp (Inner (HostOp k)) = do
           scope <- castScope <$> askScope
-          runReaderT (runDoubleBufferM $ Inner <$> optimiseKernel k) $
-            Env scope optimiseInKernelOp True
+          modifyNameSource $
+            runState (runReaderT (runDoubleBufferM $ Inner . HostOp <$> optimiseKernel k) $
+                      Env scope optimiseInKernelOp optimiseLoop)
           where optimiseKernel =
                   mapKernelM identityKernelMapper
                   { mapOnKernelBody = optimiseBody
@@ -82,98 +81,98 @@ optimiseFunDef fundec = do
           return $ Inner $ GroupStream w maxchunk lam' accs arrs
         optimiseInKernelOp op = return op
 
-data Env lore m = Env { envScope :: Scope lore
-                      , envOptimiseOp :: Op lore -> DoubleBufferM lore m (Op lore)
-                      , envCopyInit :: Bool
-                      -- ^ If true, copy initial values of merge
-                      -- parameters.  This is necessary to remove
-                      -- existential memory inside kernels, but seems to
-                      -- break C compiler vectorisation in sequential
-                      -- code.  We set this to true once we enter
-                      -- kernels.
-                      }
+        doNotTouchLoop ctx val body = return (mempty, ctx, val, body)
 
-newtype DoubleBufferM lore m a = DoubleBufferM { runDoubleBufferM :: ReaderT (Env lore m) m a }
-                          deriving (Functor, Applicative, Monad,
-                                    MonadReader (Env lore m), MonadFreshNames)
+data Env lore = Env { envScope :: Scope lore
+                    , envOptimiseOp :: Op lore -> DoubleBufferM lore (Op lore)
+                    , envOptimiseLoop :: OptimiseLoop lore
+                    }
 
-instance (Annotations lore, Applicative m, Monad m) =>
-         HasScope lore (DoubleBufferM lore m) where
+newtype DoubleBufferM lore a =
+  DoubleBufferM { runDoubleBufferM :: ReaderT (Env lore) (State VNameSource) a }
+  deriving (Functor, Applicative, Monad, MonadReader (Env lore), MonadFreshNames)
+
+instance Annotations lore => HasScope lore (DoubleBufferM lore) where
   askScope = asks envScope
 
-instance (Annotations lore, Applicative m, Monad m) =>
-         LocalScope lore (DoubleBufferM lore m) where
+instance Annotations lore => LocalScope lore (DoubleBufferM lore) where
   localScope scope = local $ \env -> env { envScope = envScope env <> scope }
 
 -- | Bunch up all the constraints for less typing.
-type LoreConstraints lore inner m =
+type LoreConstraints lore inner =
   (ExpAttr lore ~ (), BodyAttr lore ~ (),
-   ExplicitMemorish lore, Op lore ~ MemOp inner, MonadFreshNames m)
+   ExplicitMemorish lore, Op lore ~ MemOp inner,
+   BinderOps lore)
 
-optimiseBody :: LoreConstraints lore inner m =>
-                Body lore -> DoubleBufferM lore m (Body lore)
+optimiseBody :: LoreConstraints lore inner =>
+                Body lore -> DoubleBufferM lore (Body lore)
 optimiseBody body = do
-  bnds' <- optimiseStms $ bodyStms body
-  return $ body { bodyStms = bnds' }
+  bnds' <- optimiseStms $ stmsToList $ bodyStms body
+  return $ body { bodyStms = stmsFromList bnds' }
 
-optimiseStms :: LoreConstraints lore inner m =>
-                [Stm lore] -> DoubleBufferM lore m [Stm lore]
+optimiseStms :: LoreConstraints lore inner =>
+                [Stm lore] -> DoubleBufferM lore [Stm lore]
 optimiseStms [] = return []
 optimiseStms (e:es) = do
   e_es <- optimiseStm e
   es' <- localScope (castScope $ scopeOf e_es) $ optimiseStms es
   return $ e_es ++ es'
 
-optimiseStm :: LoreConstraints lore inner m =>
-               Stm lore -> DoubleBufferM lore m [Stm lore]
-optimiseStm (Let pat () (DoLoop ctx val form body)) = do
-  body' <- localScope (scopeOfLoopForm form <> scopeOfFParams (map fst $ ctx++val)) $
+optimiseStm :: forall lore inner.
+               LoreConstraints lore inner =>
+               Stm lore -> DoubleBufferM lore [Stm lore]
+optimiseStm (Let pat aux (DoLoop ctx val form body)) = do
+  body' <- localScope (scopeOf form <> scopeOfFParams (map fst $ ctx++val)) $
            optimiseBody body
-  (bnds, ctx', val', body'') <- optimiseLoop ctx val body'
-  return $ bnds ++ [Let pat () $ DoLoop ctx' val' form body'']
-optimiseStm (Let pat () e) = pure . Let pat () <$> mapExpM optimise e
-  where optimise = identityMapper { mapOnBody = const optimiseBody
+  opt_loop <- asks envOptimiseLoop
+  (bnds, ctx', val', body'') <- opt_loop ctx val body'
+  return $ bnds ++ [Let pat aux $ DoLoop ctx' val' form body'']
+optimiseStm (Let pat aux e) =
+  pure . Let pat aux <$> mapExpM optimise e
+  where optimise = identityMapper { mapOnBody = \_ x ->
+                                      -- This type annotation is
+                                      -- necessary to prevent the GHC
+                                      -- 8.4 type checker from going
+                                      -- nuts.
+                                      optimiseBody x :: DoubleBufferM lore (Body lore)
                                   , mapOnOp = optimiseOp
                                   }
 
-optimiseOp :: MonadFreshNames m =>
-              Op lore -> DoubleBufferM lore m (Op lore)
+optimiseOp :: Op lore -> DoubleBufferM lore (Op lore)
 optimiseOp op = do f <- asks envOptimiseOp
                    f op
 
-optimiseKernelBody :: MonadFreshNames m =>
-                      KernelBody InKernel
-                   -> DoubleBufferM InKernel m (KernelBody InKernel)
+optimiseKernelBody :: KernelBody InKernel
+                   -> DoubleBufferM InKernel (KernelBody InKernel)
 optimiseKernelBody kbody = do
-  stms' <- optimiseStms $ kernelBodyStms kbody
-  return $ kbody { kernelBodyStms = stms' }
+  stms' <- optimiseStms $ stmsToList $ kernelBodyStms kbody
+  return $ kbody { kernelBodyStms = stmsFromList stms' }
 
-optimiseLambda :: MonadFreshNames m =>
-                  Lambda InKernel -> DoubleBufferM InKernel m (Lambda InKernel)
+optimiseLambda :: Lambda InKernel -> DoubleBufferM InKernel (Lambda InKernel)
 optimiseLambda lam = do
   body <- localScope (castScope $ scopeOf lam) $ optimiseBody $ lambdaBody lam
   return lam { lambdaBody = body }
 
-optimiseGroupStreamLambda :: MonadFreshNames m =>
-                             GroupStreamLambda InKernel
-                          -> DoubleBufferM InKernel m (GroupStreamLambda InKernel)
+optimiseGroupStreamLambda :: GroupStreamLambda InKernel
+                          -> DoubleBufferM InKernel (GroupStreamLambda InKernel)
 optimiseGroupStreamLambda lam = do
   body <- localScope (scopeOf lam) $
           optimiseBody $ groupStreamLambdaBody lam
   return lam { groupStreamLambdaBody = body }
 
-optimiseLoop :: LoreConstraints lore inner m =>
-                [(FParam lore, SubExp)] -> [(FParam lore, SubExp)] -> Body lore
-             -> DoubleBufferM lore m ([Stm lore],
-                                 [(FParam lore, SubExp)],
-                                 [(FParam lore, SubExp)],
-                                 Body lore)
+type OptimiseLoop lore =
+  [(FParam lore, SubExp)] -> [(FParam lore, SubExp)] -> Body lore
+  -> DoubleBufferM lore ([Stm lore],
+                         [(FParam lore, SubExp)],
+                         [(FParam lore, SubExp)],
+                         Body lore)
+
+optimiseLoop :: LoreConstraints lore inner => OptimiseLoop lore
 optimiseLoop ctx val body = do
   -- We start out by figuring out which of the merge variables should
   -- be double-buffered.
   buffered <- doubleBufferMergeParams
-              (zip (map fst ctx) (bodyResult body))
-              (map fst merge)
+              (zip (map fst ctx) (bodyResult body)) (map fst merge)
               (boundInBody body)
   -- Then create the allocations of the buffers and copies of the
   -- initial values.
@@ -187,7 +186,7 @@ optimiseLoop ctx val body = do
 
 -- | The booleans indicate whether we should also play with the
 -- initial merge values.
-data DoubleBuffer lore = BufferAlloc VName SubExp Space Bool
+data DoubleBuffer lore = BufferAlloc VName (PrimExp VName) Space Bool
                        | BufferCopy VName IxFun VName Bool
                        -- ^ First name is the memory block to copy to,
                        -- second is the name of the array copy.
@@ -197,15 +196,15 @@ data DoubleBuffer lore = BufferAlloc VName SubExp Space Bool
 doubleBufferMergeParams :: (ExplicitMemorish lore, MonadFreshNames m) =>
                            [(FParam lore,SubExp)]
                         -> [FParam lore] -> Names
-                        -> DoubleBufferM lore m [DoubleBuffer lore]
-doubleBufferMergeParams ctx_and_res val_params bound_in_loop = do
-  copy_init <- asks envCopyInit
-  evalStateT (mapM (buffer copy_init) val_params) M.empty
-  where loopVariant v = v `S.member` bound_in_loop || v `elem` map (paramName . fst) ctx_and_res
+                        -> m [DoubleBuffer lore]
+doubleBufferMergeParams ctx_and_res val_params bound_in_loop =
+  evalStateT (mapM buffer val_params) M.empty
+  where loopVariant v = v `S.member` bound_in_loop ||
+                        v `elem` map (paramName . fst) ctx_and_res
 
-        loopInvariantSize copy_init (Constant v) =
-          Just (Constant v, copy_init)
-        loopInvariantSize copy_init (Var v) =
+        loopInvariantSize (Constant v) =
+          Just (Constant v, True)
+        loopInvariantSize (Var v) =
           case find ((==v) . paramName . fst) ctx_and_res of
             Just (_, Constant val) ->
               Just (Constant val, False)
@@ -214,17 +213,28 @@ doubleBufferMergeParams ctx_and_res val_params bound_in_loop = do
             Just _ ->
               Nothing
             Nothing ->
-              Just (Var v, copy_init)
+              Just (Var v, True)
 
-        buffer copy_init fparam = case paramType fparam of
-          Mem size space
-            | Just (size', b) <- loopInvariantSize copy_init size -> do
+        sizeForMem mem = maybeHead $ mapMaybe (arrayInMem . paramAttr) val_params
+          where arrayInMem (MemArray pt shape _ (ArrayIn arraymem ixfun))
+                  | IxFun.isDirect ixfun,
+                    Just (dims, b) <-
+                      mapAndUnzipM loopInvariantSize $ shapeDims shape,
+                    mem == arraymem =
+                      Just (arraySizeInBytesExp $
+                             Array pt (Shape dims) NoUniqueness,
+                            or b)
+                arrayInMem _ = Nothing
+
+        buffer fparam = case paramType fparam of
+          Mem space
+            | Just (size, b) <- sizeForMem $ paramName fparam -> do
                 -- Let us double buffer this!
                 bufname <- lift $ newVName "double_buffer_mem"
                 modify $ M.insert (paramName fparam) (bufname, b)
-                return $ BufferAlloc bufname size' space b
+                return $ BufferAlloc bufname size space b
           Array {}
-            | ArrayMem _ _ _ mem ixfun <- paramAttr fparam -> do
+            | MemArray _ _ _ (ArrayIn mem ixfun) <- paramAttr fparam -> do
                 buffered <- gets $ M.lookup mem
                 case buffered of
                   Just (bufname, b) -> do
@@ -234,25 +244,24 @@ doubleBufferMergeParams ctx_and_res val_params bound_in_loop = do
                     return NoBuffer
           _ -> return NoBuffer
 
-allocStms :: LoreConstraints lore inner m =>
+allocStms :: LoreConstraints lore inner =>
              [(FParam lore,SubExp)] -> [DoubleBuffer lore]
-          -> DoubleBufferM lore m ([(FParam lore, SubExp)],
-                                    [Stm lore])
+          -> DoubleBufferM lore ([(FParam lore, SubExp)], [Stm lore])
 allocStms merge = runWriterT . zipWithM allocation merge
   where allocation m@(Param pname _, _) (BufferAlloc name size space b) = do
-          tell [Let (Pattern [] [PatElem name BindVar $ MemMem size space]) () $
-                Op $ Alloc size space]
-          if b
-            then return (Param pname $ MemMem size space, Var name)
-            else return m
+          stms <- lift $ runBinder_ $ do
+            size' <- letSubExp "double_buffer_size" =<< toExp size
+            letBindNames_ [name] $ Op $ Alloc size' space
+          tell $ stmsToList stms
+          if b then return (Param pname $ MemMem space, Var name)
+               else return m
         allocation (f, Var v) (BufferCopy mem _ _ b) | b = do
           v_copy <- lift $ newVName $ baseString v ++ "_double_buffer_copy"
           (_v_mem, v_ixfun) <- lift $ lookupArraySummary v
           let bt = elemType $ paramType f
               shape = arrayShape $ paramType f
-              bound = ArrayMem bt shape NoUniqueness mem v_ixfun
-          tell [Let (Pattern []
-                     [PatElem v_copy BindVar bound]) () $
+              bound = MemArray bt shape NoUniqueness $ ArrayIn mem v_ixfun
+          tell [Let (Pattern [] [PatElem v_copy bound]) (defAux ()) $
                 BasicOp $ Copy v]
           return (f, Var v_copy)
         allocation (f, se) _ =
@@ -266,7 +275,7 @@ doubleBufferResult valparams buffered (Body () bnds res) =
   let (ctx_res, val_res) = splitAt (length res - length valparams) res
       (copybnds,val_res') =
         unzip $ zipWith3 buffer valparams buffered val_res
-  in Body () (bnds++catMaybes copybnds) $ ctx_res ++ val_res'
+  in Body () (bnds<>stmsFromList (catMaybes copybnds)) $ ctx_res ++ val_res'
   where buffer _ (BufferAlloc bufname _ _ _) _ =
           (Nothing, Var bufname)
 
@@ -274,8 +283,8 @@ doubleBufferResult valparams buffered (Body () bnds res) =
           -- To construct the copy we will need to figure out its type
           -- based on the type of the function parameter.
           let t = resultType $ paramType fparam
-              summary = ArrayMem (elemType t) (arrayShape t) NoUniqueness bufname ixfun
-              copybnd = Let (Pattern [] [PatElem copyname BindVar summary]) () $
+              summary = MemArray (elemType t) (arrayShape t) NoUniqueness $ ArrayIn bufname ixfun
+              copybnd = Let (Pattern [] [PatElem copyname summary]) (defAux ()) $
                         BasicOp $ Copy v
           in (Just copybnd, Var copyname)
 

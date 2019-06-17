@@ -1,13 +1,12 @@
--- Test that top-to-bottom loops work.
--- ==
--- input { 3 [1,2,3,4,5] }
--- output { [5, 4] }
--- input { 5 [1,2,3,4,5] }
--- output { empty(i32) }
+-- This program exposed an obscure problem in the type-checking of
+-- loops with existential sizes (before inlining).
 
-let main(l: i32, a: [#n]i32): []i32 =
-  loop (b = replicate (n-l) 0) = for n > i >= l do
-    let j = n - i - 1
-    let b[j] = a[i] in
-    b
-  in b
+let step [n] (cost: *[n]i32,
+              updating_graph_mask : *[n]bool) : (*[n]i32, *[n]bool) =
+  (cost, updating_graph_mask)
+
+let main (n: i32, cost: *[]i32, updating_graph_mask: *[]bool) =
+  loop (cost, updating_graph_mask) = (cost, updating_graph_mask)
+  while updating_graph_mask[0] do
+    let (cost', updating_graph_mask') = step(cost, updating_graph_mask)
+    in (cost', updating_graph_mask')

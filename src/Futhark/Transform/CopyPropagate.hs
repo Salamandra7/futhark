@@ -9,12 +9,11 @@ module Futhark.Transform.CopyPropagate
 
 import Futhark.MonadFreshNames
 import Futhark.Representation.AST
-import Futhark.Optimise.Simplifier.Engine
-import Futhark.Optimise.Simplifier (simplifyStmsWithRules)
+import Futhark.Optimise.Simplify
 
+-- | Run copy propagation.
 copyPropagateInStms :: (MonadFreshNames m, SimplifiableLore lore, HasScope lore m) =>
                        SimpleOps lore
-                    -> [Stm lore]
-                    -> m [Stm lore]
-copyPropagateInStms simpl =
-  simplifyStmsWithRules simpl mempty noExtraHoistBlockers
+                    -> Stms lore
+                    -> m (Stms lore)
+copyPropagateInStms simpl = simplifyStms simpl mempty noExtraHoistBlockers
